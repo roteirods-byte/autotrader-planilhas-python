@@ -1,44 +1,27 @@
 #!/usr/bin/env python3
 """
-worker_entrada.py
+worker_entrada.py  (MODO DEMO PURO)
 
-Orquestrador da ENTRADA do AUTOTRADER.
+NÃO USA NENHUMA CORRETORA.
+NÃO IMPORTA ccxt.
+NÃO CHAMA exchanges/calculadora/analise_sinal.
 
-- MODO_DEMO = True  -> gera sinais internos, sem corretoras,
-                      apenas para alimentar o painel ENTRADA.
-- MODO_DEMO = False -> usa exchanges (KuCoin, Gate.io, OKX) +
-                       calculadora + analise_sinal.
-
-Saída: entrada.json no formato:
-{
-  "generated_at": "...",
-  "swing": [...],
-  "posicional": [...]
-}
+Apenas gera dados sintéticos para alimentar o PAINEL ENTRADA,
+com valores diferentes por moeda, para Swing (4h) e Posicional (1d).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import random
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Dict, List
 
 from config import TZINFO, PRICE_DECIMALS, PCT_DECIMALS  # type: ignore
-from exchanges import get_ohlcv  # camada A (usado só no modo real)
-from calculadora import calcular_indicadores  # camada B
-from analise_sinal import analisar_sinal  # camada C
 
-# ============================
-# CONFIGURAÇÃO GERAL
-# ============================
 
-# Liga/desliga modo DEMO (pode mudar para False no futuro)
-MODO_DEMO = os.getenv("MODO_DEMO_ENTRADA", "true").lower() == "true"
-
-# Universo fixo de moedas
+# Universo fixo de moedas (sem USDT)
 COINS = sorted(
     [
         "AAVE", "ADA", "APT", "ARB", "ATOM", "AVAX", "AXS", "BCH", "BNB",
@@ -49,17 +32,8 @@ COINS = sorted(
     ]
 )
 
-# Timeframes oficiais (para modo real)
-TIMEFRAME_SWING = "4h"
-TIMEFRAME_POSICIONAL = "1d"
-
-# Caminho padrão do JSON de saída
 ENTRADA_JSON_PATH = os.getenv("ENTRADA_JSON_PATH", "entrada.json")
 
-
-# ============================
-# MODELOS E HELPERS
-# ============================
 
 @dataclass
 class SinalEntrada:
@@ -79,20 +53,16 @@ def _now_brt() -> datetime:
 
 def _log(msg: str) -> None:
     ts = _now_brt().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [worker_entrada] {msg}", flush=True)
+    print(f"[{ts}] [worker_entrada_demo] {msg}", flush=True)
 
-
-# ============================
-# MODO DEMO – GERAÇÃO INTERNA
-# ============================
 
 def _gerar_sinais_demo_para_modo(modo: str) -> List[SinalEntrada]:
     """
-    Gera sinais sintéticos (demo) para todas as moedas.
+    Gera sinais sintéticos para todas as moedas.
 
-    - Valores diferentes por moeda.
-    - Swing: ganhos menores (~3–6%), assert 68–80%.
-    - Posicional: ganhos maiores (~8–12%), assert 72–84%.
+    - Swing: ganho ~3–5%, assert ~68–78%.
+    - Posicional: ganho ~6–12%, assert ~70–84%.
+    - Valores variam por moeda para ficar “com cara de real”.
     """
     resultados: List[SinalEntrada] = []
     ts = _now_brt()
@@ -100,38 +70,35 @@ def _gerar_sinais_demo_para_modo(modo: str) -> List[SinalEntrada]:
     hora_str = ts.strftime("%H:%M")
 
     for i, coin in enumerate(COINS):
-        # Preço base varia por moeda e modo
-        base_preco = 10.0 + (i * 7.5)
+        # Preço base aumenta por moeda
+        preco_base = 5.0 + i * 7.3
         if modo == "posicional":
-            base_preco *= 1.1
+            preco_base *= 1.15
 
-        # Define direção LONG/SHORT alternando
-        if (i % 2 == 0 and modo == "swing") or (i % 3 == 0 and modo == "posicional"):
+        # Direção alternada (só para visual)
+        if (modo == "swing" and i % 2 == 0) or (modo == "posicional" and i % 3 == 0):
             sinal = "LONG"
         else:
             sinal = "SHORT"
 
-        # GANHO % varia por moeda e modo
+        # GANHO %
         if modo == "swing":
-            ganho_base = 3.0 + (i % 5) * 0.35  # ~3.0 a ~4.4
+            ganho = 3.0 + (i % 6) * 0.35      # ~3,00 a ~4,75
         else:
-            ganho_base = 8.0 + (i % 6) * 0.5   # ~8.0 a ~10.5
+            ganho = 6.0 + (i % 8) * 0.65      # ~6,00 a ~10,55
 
-        # ASSERT % varia por moeda
+        # ASSERT %
         if modo == "swing":
-            assert_base = 68.0 + (i % 4) * 1.8  # ~68–73
+            assertiva = 68.0 + (i % 5) * 1.9  # ~68 a ~75,6
         else:
-            assert_base = 72.0 + (i % 4) * 2.0  # ~72–78
+            assertiva = 70.0 + (i % 5) * 2.4  # ~70 a ~79,6
 
-        preco = round(base_preco, PRICE_DECIMALS)
+        preco = round(preco_base, PRICE_DECIMALS)
 
         if sinal == "LONG":
-            alvo = preco * (1.0 + ganho_base / 100.0)
+            alvo = preco * (1.0 + ganho / 100.0)
         else:
-            alvo = preco * (1.0 - ganho_base / 100.0)
-
-        ganho_pct = ganho_base
-        assert_pct = max(65.0, min(88.0, assert_base))
+            alvo = preco * (1.0 - ganho / 100.0)
 
         resultados.append(
             SinalEntrada(
@@ -139,20 +106,20 @@ def _gerar_sinais_demo_para_modo(modo: str) -> List[SinalEntrada]:
                 sinal=sinal,
                 preco=round(preco, PRICE_DECIMALS),
                 alvo=round(alvo, PRICE_DECIMALS),
-                ganho_pct=round(ganho_pct, PCT_DECIMALS),
-                assert_pct=round(assert_pct, PCT_DECIMALS),
+                ganho_pct=round(ganho, PCT_DECIMALS),
+                assert_pct=round(assertiva, PCT_DECIMALS),
                 data=data_str,
                 hora=hora_str,
             )
         )
 
     resultados.sort(key=lambda s: s.par)
-    _log(f"[DEMO] Gerados {len(resultados)} sinais para modo={modo}.")
+    _log(f"[DEMO PURO] Gerados {len(resultados)} sinais para modo={modo}.")
     return resultados
 
 
-def gerar_sinais_demo() -> Dict[str, object]:
-    _log("[DEMO] Iniciando geração de sinais DEMO...")
+def gerar_sinais_demo_puro() -> Dict[str, object]:
+    _log("[DEMO PURO] Iniciando geração de sinais DEMO...")
     swing = _gerar_sinais_demo_para_modo("swing")
     posicional = _gerar_sinais_demo_para_modo("posicional")
 
@@ -163,114 +130,25 @@ def gerar_sinais_demo() -> Dict[str, object]:
     }
 
     _log(
-        f"[DEMO] Sinais gerados: {len(payload['swing'])} swing, "
+        f"[DEMO PURO] Sinais gerados: {len(payload['swing'])} swing, "
         f"{len(payload['posicional'])} posicional."
     )
     return payload
 
-
-# ============================
-# MODO REAL – USA CORRETORAS
-# ============================
-
-def _gerar_sinais_por_modo_real(
-    modo: str,
-    timeframe: str,
-) -> List[SinalEntrada]:
-    resultados: List[SinalEntrada] = []
-    _log(f"[REAL] Iniciando geração de sinais ({modo}, tf={timeframe})...")
-
-    for coin in COINS:
-        df = get_ohlcv(coin, timeframe=timeframe, limit=200)
-        if df is None:
-            _log(f"[REAL] {coin} {modo}: sem dados de candles, pulando.")
-            continue
-
-        indicadores = calcular_indicadores(df)
-        if indicadores is None:
-            _log(f"[REAL] {coin} {modo}: sem indicadores, pulando.")
-            continue
-
-        sinal_info = analisar_sinal(coin, modo, indicadores)
-        if sinal_info is None:
-            # Filtrado pelos critérios (ganho >= 3%, assert >= 65%)
-            continue
-
-        preco = float(indicadores["preco"])
-        alvo = float(sinal_info["alvo"])
-        ganho_pct = float(sinal_info["ganho_pct"])
-        assert_pct = float(sinal_info["assert_pct"])
-        sinal = str(sinal_info["sinal"]).upper()
-
-        ts = _now_brt()
-        data_str = ts.strftime("%Y-%m-%d")
-        hora_str = ts.strftime("%H:%M")
-
-        resultados.append(
-            SinalEntrada(
-                par=coin,
-                sinal=sinal,
-                preco=round(preco, PRICE_DECIMALS),
-                alvo=round(alvo, PRICE_DECIMALS),
-                ganho_pct=round(ganho_pct, PCT_DECIMALS),
-                assert_pct=round(assert_pct, PCT_DECIMALS),
-                data=data_str,
-                hora=hora_str,
-            )
-        )
-
-    resultados.sort(key=lambda s: s.par)
-    _log(f"[REAL] Finalizado modo={modo}: {len(resultados)} sinais aprovados.")
-    return resultados
-
-
-def gerar_sinais_real() -> Dict[str, object]:
-    _log("[REAL] Iniciando geração de sinais para todas as moedas...")
-    swing = _gerar_sinais_por_modo_real("swing", TIMEFRAME_SWING)
-    posicional = _gerar_sinais_por_modo_real("posicional", TIMEFRAME_POSICIONAL)
-
-    payload = {
-        "generated_at": _now_brt().isoformat(),
-        "swing": [asdict(s) for s in swing],
-        "posicional": [asdict(s) for s in posicional],
-    }
-
-    _log(
-        f"[REAL] Sinais gerados: {len(payload['swing'])} swing, "
-        f"{len(payload['posicional'])} posicional."
-    )
-    return payload
-
-
-# ============================
-# PERSISTÊNCIA
-# ============================
 
 def salvar_json(payload: Dict[str, object]) -> None:
-    """Salva o payload em ENTRADA_JSON_PATH de forma atômica."""
     tmp_path = ENTRADA_JSON_PATH + ".tmp"
-
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-
     os.replace(tmp_path, ENTRADA_JSON_PATH)
     _log(f"Arquivo salvo em: {ENTRADA_JSON_PATH}")
 
 
-# ============================
-# MAIN
-# ============================
-
 def main() -> None:
-    if MODO_DEMO:
-        _log("Executando worker_entrada em MODO_DEMO=TRUE.")
-        payload = gerar_sinais_demo()
-    else:
-        _log("Executando worker_entrada em modo REAL (corretoras).")
-        payload = gerar_sinais_real()
-
+    _log("Executando worker_entrada DEMO PURO (sem corretoras)...")
+    payload = gerar_sinais_demo_puro()
     salvar_json(payload)
-    _log("worker_entrada finalizado com sucesso.")
+    _log("worker_entrada DEMO finalizado com sucesso.")
 
 
 if __name__ == "__main__":
