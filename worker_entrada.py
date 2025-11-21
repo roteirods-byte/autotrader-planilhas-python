@@ -195,17 +195,14 @@ def fetch_ohlcv_any(
 # CÁLCULOS DOS SINAIS
 # ============================
 
-
 def calcular_sinal_para_df(
     coin: str,
     df: pd.DataFrame,
     modo: str,
 ) -> Optional[SinalEntrada]:
     """
-    Calcula o sinal (LONG/SHORT), alvo, ganho % e assert % para uma moeda,
-    dado um DataFrame de candles já carregado.
-
-    `modo` deve ser "swing" ou "posicional".
+    Calcula o sinal (LONG/SHORT), alvo, ganho % e assert % para uma moeda.
+    `modo` = "swing" ou "posicional".
     """
     if df.shape[0] < 60:
         log(f"{coin} modo={modo}: poucos candles ({df.shape[0]}), pulando.")
@@ -215,6 +212,98 @@ def calcular_sinal_para_df(
     high = df["high"].astype(float)
     low = df["low"].astype(float)
 
+    ema_fast = EMAIndicator(close=close, window=9).ema_indicator()
+    ema_slow = EMAIndicator(close=close, window=21).ema_indicator()
+    atr = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
+    adx = ADXIndicator(high=high, low=low, close=close, window=14).adx()
+
+    last_close = float(close.iloc[-1])
+    last_ema_fast = float(ema_fast.iloc[-1])
+    last_ema_slow = float(ema_slow.iloc[-1])
+    last_atr = float(atr.iloc[-1])
+    last_adx = float(adx.iloc[-1])
+
+    if not all(math.isfinite(x) for x in [last_close, last_ema_fast, last_ema_slow, last_atr, last_adx]):
+        log(f"{coin} modo={modo}: valores não finitos, pulando.")
+        return None
+
+    # Direção principal: LONG se EMA rápida acima da lenta, senão SHORT
+    if last_ema_fast > last_ema_slow:
+        sinal = "LONG"
+    else:
+        sinal = "SHORT"
+
+    # ATR em % do preço (volatilidade relativa), com limites
+    atr_pct = (last_atr / last_close) * 100.0
+    atr_pct = max(0.5, min(atr_pct, 15.0))
+
+    # Multiplicadores diferentes para Swing x Posicional
+    if modo == "swing":
+        mult = 1.2   # alvo menor, prazos curtos
+    else:
+        mult = 2.0   # alvo maior, prazo longo
+
+    ganho_pct_raw = atr_pct * mult
+    ganho_pct_raw = max(MIN_GANHO, min(ganho_pct_raw, 30.0))
+
+    # Alvo conforme direção
+    if sinal == "LONG":
+        alvo = last_close * (1.0 + ganho_pct_raw / 100.0)
+    else:
+        alvo = last_close * (1.0 - ganho_pct_raw / 100.0)
+
+    # Ganho real em %
+    if sinal == "LONG":
+        ganho_pct_real = ((alvo - last_close) / last_close) * 100.0
+    else:
+        ganho_pct_real = ((last_close - alvo) / last_close) * 100.0
+
+    # ASSERT %:
+    #  - parte do ADX (força da tendência)
+    #  - parte do alinhamento entre sinal e EMAs
+    adx_norm = max(0.0, min(1.0, (last_adx - 10.0) / 40.0))  # ADX ~10-50
+    alinhado = (
+        (sinal == "LONG" and last_ema_fast > last_ema_slow) or
+        (sinal == "SHORT" and last_ema_fast < last_ema_slow)
+    )
+    align_score = 1.0 if alinhado else 0.0
+
+    # Base 55%, + até 20% do ADX, +10% se alinhado
+    assert_pct = 55.0 + 20.0 * adx_norm + 10.0 * align_score
+
+    # Limites finais
+    assert_pct = max(60.0, min(90.0, assert_pct))
+
+    # Filtro mínimo antes de publicar
+    if ganho_pct_real < MIN_GANHO or assert_pct < MIN_ASSERT:
+        log(
+            f"{coin} modo={modo}: filtrado (ganho={ganho_pct_real:.2f}%, "
+            f"assert={assert_pct:.2f}%)."
+        )
+        return None
+
+    # Arredondamentos
+    preco_r = round(last_close, PRICE_DECIMALS)
+    alvo_r = round(alvo, PRICE_DECIMALS)
+    ganho_r = round(ganho_pct_real, PCT_DECIMALS)
+    assert_r = round(assert_pct, PCT_DECIMALS)
+
+    ts = now_brt()
+    data_str = ts.strftime("%Y-%m-%d")
+    hora_str = ts.strftime("%H:%M")
+
+    return SinalEntrada(
+        par=coin,
+        sinal=sinal,
+        preco=preco_r,
+        alvo=alvo_r,
+        ganho_pct=ganho_r,
+        assert_pct=assert_r,
+        data=data_str,
+        hora=hora_str,
+    )
+
+ 
     # EMAs para direção de tendência
     ema_fast = EMAIndicator(close=close, window=9).ema_indicator()
     ema_slow = EMAIndicator(close=close, window=21).ema_indicator()
