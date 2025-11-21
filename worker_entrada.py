@@ -8,393 +8,391 @@ Gera o arquivo entrada.json usado pelo painel ENTRADA.
 - Busca dados de preço/candles nas corretoras via ccxt (Binance e Bybit).
 - Calcula sinais Swing (4H) e Posicional (1D) moeda por moeda.
 - Para cada moeda/mode:
-    * Decide LONG ou SHORT de forma determinística a partir da tendência.
-    * Calcula alvo (ALVO), ganho percentual (GANHO %) e assertividade (ASSERT %).
-- Aplica filtros mínimos:
+    * Decide LONG ou SHORT a partir da tendência (EMAs).
+    * Calcula alvo em função da volatilidade (ATR) e converte em GANHO %.
+    * Calcula uma ASSERT % individual por moeda com base em ADX / tendência.
+- Aplica filtros mínimos ANTES de publicar o sinal:
     * ganho_pct >= 3.0
     * assert_pct >= 65.0
 
-Saída:
-- /home/roteiro_ds/autotrader-painel/entrada.json (padrão)
-  ou caminho definido pela variável de ambiente ENTRADA_JSON_PATH.
+O resultado é salvo em entrada.json com o formato:
 
-Obs.: Este arquivo é pensado para rodar na VM (SSH 3) e ser versionado no GitHub.
+{
+  "generated_at": "2025-11-21T12:10:00-03:00",
+  "swing": [
+    {
+      "par": "AAVE",
+      "sinal": "LONG",
+      "preco": 155.38,
+      "alvo": 161.92,
+      "ganho_pct": 4.21,
+      "assert_pct": 71.35,
+      "data": "2025-11-21",
+      "hora": "12:10"
+    },
+    ...
+  ],
+  "posicional": [
+    ...
+  ]
+}
 """
-
 from __future__ import annotations
 
 import json
 import math
 import os
-import sys
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import ccxt
-import numpy as np
-import pandas as pd
+import ccxt  # type: ignore
+import numpy as np  # type: ignore
+import pandas as pd  # type: ignore
+from ta.trend import EMAIndicator, ADXIndicator  # type: ignore
+from ta.volatility import AverageTrueRange  # type: ignore
 
-from config import TZINFO, PRICE_DECIMALS, PCT_DECIMALS
+try:
+    # Config oficial do projeto (se existir)
+    from config import TZINFO, PRICE_DECIMALS, PCT_DECIMALS  # type: ignore
+except Exception:  # fallback seguro para testes
+    from zoneinfo import ZoneInfo
+
+    TZINFO = ZoneInfo("America/Sao_Paulo")
+    PRICE_DECIMALS = int(os.getenv("PRICE_DECIMALS", "3"))
+    PCT_DECIMALS = int(os.getenv("PCT_DECIMALS", "2"))
+
 
 # ============================
-# CONFIGURAÇÕES GERAIS
+# PARÂMETROS GERAIS
 # ============================
 
-ENTRADA_JSON_PATH = os.getenv(
-    "ENTRADA_JSON_PATH",
-    "/home/roteiro_ds/autotrader-painel/entrada.json",
-)
-
-# Universo fixo de moedas (em ordem alfabética)
-MOEDAS: List[str] = [
+# Universo fixo de moedas (sem "USDT")
+COINS = [
     "AAVE", "ADA", "APT", "ARB", "ATOM", "AVAX", "AXS", "BCH", "BNB",
     "BTC", "DOGE", "DOT", "ETH", "FET", "FIL", "FLUX", "ICP", "INJ",
     "LDO", "LINK", "LTC", "NEAR", "OP", "PEPE", "POL", "RATS", "RENDER",
     "RUNE", "SEI", "SHIB", "SOL", "SUI", "TIA", "TNSR", "TON", "TRX",
     "UNI", "WIF", "XRP",
 ]
+COINS = sorted(COINS)
 
 # Timeframes
 TF_SWING = "4h"   # Swing
-TF_POS   = "1d"   # Posicional
+TF_POS = "1d"     # Posicional
 
-# Par padrão nas corretoras (COIN/USDT)
-def coin_to_pair(coin: str) -> str:
-    return f"{coin}/USDT"
+# Multiplicadores de ATR por modo
+ATR_MULT_SWING = 1.0
+ATR_MULT_POS = 1.5
+
+# Limites de filtros
+MIN_GANHO = 3.0     # mínimo 3%
+MIN_ASSERT = 65.0   # mínimo 65%
+
+# Limites de assertividade (para não ficar absurdo)
+MIN_ASSERT_CLAMP = 50.0
+MAX_ASSERT_CLAMP = 90.0
+
+# Caminho padrão de saída
+ENTRADA_JSON_PATH = os.getenv("ENTRADA_JSON_PATH", "entrada.json")
 
 
 # ============================
 # HELPERS DE TEMPO / LOG
 # ============================
 
+
 def now_brt() -> datetime:
-    """Agora em timezone BRT (usando TZINFO do config)."""
+    """Agora em timezone BRT."""
     return datetime.now(TZINFO)
 
 
-def fmt_ts(dt: datetime) -> Tuple[str, str]:
-    """Devolve (data_str, hora_str) no formato do projeto."""
-    return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
-
-
 def log(msg: str) -> None:
-    now = now_brt().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {msg}", file=sys.stdout, flush=True)
+    ts = now_brt().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [worker_entrada] {msg}", flush=True)
 
 
 # ============================
-# CONEXÃO COM CORRETORAS
+# MODELOS
 # ============================
+
 
 @dataclass
-class ExchangeClient:
-    name: str
-    client: ccxt.Exchange
-
-    def safe_fetch_ohlcv(
-        self,
-        pair: str,
-        timeframe: str,
-        limit: int = 150,
-        max_retries: int = 3,
-        sleep_sec: float = 1.0,
-    ) -> Optional[pd.DataFrame]:
-        last_err: Optional[Exception] = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                data = self.client.fetch_ohlcv(pair, timeframe=timeframe, limit=limit)
-                if not data:
-                    raise RuntimeError("Sem dados OHLCV")
-                df = pd.DataFrame(
-                    data,
-                    columns=["ts", "open", "high", "low", "close", "volume"],
-                )
-                df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(TZINFO)
-                df = df.set_index("ts")
-                return df
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                log(f"[{self.name}] Erro fetch_ohlcv {pair} {timeframe} (tentativa {attempt}/{max_retries}): {e}")
-                time.sleep(sleep_sec * attempt)
-        log(f"[{self.name}] Falha ao obter OHLCV {pair} {timeframe}: {last_err}")
-        return None
-
-    def safe_fetch_ticker(
-        self,
-        pair: str,
-        max_retries: int = 3,
-        sleep_sec: float = 1.0,
-    ) -> Optional[float]:
-        last_err: Optional[Exception] = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                ticker = self.client.fetch_ticker(pair)
-                price = float(ticker["last"])
-                return price
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                log(f"[{self.name}] Erro fetch_ticker {pair} (tentativa {attempt}/{max_retries}): {e}")
-                time.sleep(sleep_sec * attempt)
-        log(f"[{self.name}] Falha ao obter preço de {pair}: {last_err}")
-        return None
+class SinalEntrada:
+    par: str
+    sinal: str
+    preco: float
+    alvo: float
+    ganho_pct: float
+    assert_pct: float
+    data: str
+    hora: str
 
 
-def make_clients() -> List[ExchangeClient]:
-    """Cria clientes para Binance e Bybit (spot)."""
-    clients: List[ExchangeClient] = []
-
-    try:
-        binance = ccxt.binance({
-            "enableRateLimit": True,
-            "timeout": 15000,
-            "options": {"defaultType": "spot"},
-        })
-        clients.append(ExchangeClient("binance", binance))
-    except Exception as e:  # noqa: BLE001
-        log(f"[CRIT] Falha ao criar cliente Binance: {e}")
-
-    try:
-        bybit = ccxt.bybit({
-            "enableRateLimit": True,
-            "timeout": 15000,
-            "options": {"defaultType": "spot"},
-        })
-        clients.append(ExchangeClient("bybit", bybit))
-    except Exception as e:  # noqa: BLE001
-        log(f"[CRIT] Falha ao criar cliente Bybit: {e}")
-
-    if not clients:
-        log("[CRIT] Nenhum cliente de corretora criado. Verificar conexão/ccxt.")
-    return clients
+# ============================
+# EXCHANGES (ccxt)
+# ============================
 
 
-def fetch_ohlcv_multi(
-    clients: List[ExchangeClient],
-    coin: str,
+def criar_exchanges() -> Dict[str, ccxt.Exchange]:
+    """
+    Cria conexões de exchange via ccxt.
+    Usa modo anônimo (só leitura de dados públicos).
+    """
+    binance = ccxt.binance({"enableRateLimit": True})
+    bybit = ccxt.bybit({"enableRateLimit": True})
+    return {"binance": binance, "bybit": bybit}
+
+
+def coin_to_pair(coin: str) -> str:
+    """Converte 'BTC' -> 'BTC/USDT'."""
+    return f"{coin}/USDT"
+
+
+def fetch_ohlcv_any(
+    exs: Dict[str, ccxt.Exchange],
+    symbol: str,
     timeframe: str,
-    limit: int,
+    limit: int = 200,
 ) -> Optional[pd.DataFrame]:
-    """Tenta obter OHLCV em múltiplas corretoras, primeira que responder."""
-    pair = coin_to_pair(coin)
-    for ex in clients:
-        df = ex.safe_fetch_ohlcv(pair, timeframe=timeframe, limit=limit)
-        if df is not None and not df.empty:
-            log(f"OHLCV {coin} {timeframe} vindo de {ex.name}")
-            return df
-    return None
-
-
-def fetch_price_multi(
-    clients: List[ExchangeClient],
-    coin: str,
-) -> Optional[float]:
-    """Busca o preço atual em múltiplas corretoras; devolve a primeira resposta válida."""
-    pair = coin_to_pair(coin)
-    prices: List[float] = []
-    for ex in clients:
-        p = ex.safe_fetch_ticker(pair)
-        if p is not None and p > 0:
-            prices.append(p)
-            log(f"Preço {coin} via {ex.name}: {p}")
-    if not prices:
-        return None
-    # retorna a mediana (mais robusta contra outliers)
-    return float(np.median(prices))
-
-
-# ============================
-# CÁLCULOS DE INDICADORES
-# ============================
-
-def true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    high_low = df["high"] - df["low"]
-    high_prev = (df["high"] - prev_close).abs()
-    low_prev = (df["low"] - prev_close).abs()
-    tr = pd.concat([high_low, high_prev, low_prev], axis=1).max(axis=1)
-    return tr
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> float:
-    tr = true_range(df)
-    atr_series = tr.rolling(window=period, min_periods=period).mean()
-    return float(atr_series.iloc[-1])
-
-
-def ema(series: pd.Series, period: int) -> float:
-    if len(series) < period:
-        return float(series.iloc[-1])
-    return float(series.ewm(span=period, adjust=False).mean().iloc[-1])
-
-
-def decide_side(ema_fast: float, ema_slow: float, ema_long: float) -> str:
     """
-    Decide LONG ou SHORT de forma simples, mas determinística:
-    - EMA rápida > média > longa -> LONG
-    - EMA rápida < média < longa -> SHORT
-    - Caso misto: usa rápida vs longa (acima = LONG, abaixo = SHORT)
+    Busca OHLCV em qualquer exchange disponível (Binance ou Bybit).
+    Tenta Binance primeiro; se falhar, tenta Bybit.
+    Retorna DataFrame com colunas: [open, high, low, close, volume]
+    e índice datetime em TZINFO.
     """
-    if ema_fast >= ema_slow >= ema_long:
-        return "LONG"
-    if ema_fast <= ema_slow <= ema_long:
-        return "SHORT"
-    if ema_fast >= ema_long:
-        return "LONG"
-    return "SHORT"
+    errors: List[str] = []
 
-
-def compute_target_and_prob(
-    price: float,
-    atr_value: float,
-    regime: str,
-    side: str,
-) -> Tuple[float, float, float]:
-    """
-    Calcula ALVO, GANHO % e ASSERT %.
-
-    - Regime "SWING": alvo ≈ 1.2 * ATR.
-    - Regime "POSICIONAL": alvo ≈ 2.0 * ATR.
-    - GANHO % mínimo = 3.0.
-    - ASSERT % entre 65% e 90%, aumentando levemente com a relação ATR/preço.
-    """
-    if atr_value <= 0 or not math.isfinite(atr_value):
-        atr_value = price * 0.02  # fallback 2%
-
-    if regime.upper() == "SWING":
-        atr_mult = 1.2
-    else:  # POSICIONAL
-        atr_mult = 2.0
-
-    # ganho bruto sugerido
-    raw_gain = atr_mult * atr_value / price * 100.0
-    ganho_pct = max(3.0, raw_gain)
-
-    if side == "LONG":
-        alvo = price * (1.0 + ganho_pct / 100.0)
-    else:  # SHORT
-        alvo = price * (1.0 - ganho_pct / 100.0)
-
-    # assertividade baseada em volatilidade (ATR/preço)
-    vol_pct = atr_value / price * 100.0
-    base_assert = 70.0 + (2.0 - min(2.0, vol_pct / 10.0)) * 5.0  # 60–80 range
-    assert_pct = max(65.0, min(90.0, base_assert))
-
-    return alvo, ganho_pct, assert_pct
-
-
-# ============================
-# ENGINE DE SINAIS
-# ============================
-
-def gerar_sinais(
-    clients: Optional[List[ExchangeClient]] = None,
-) -> Dict[str, List[Dict[str, object]]]:
-    """
-    Gera sinais Swing (4H) e Posicional (1D) para todas as moedas.
-    Retorna:
-    {
-        "swing": [...],
-        "posicional": [...]
-    }
-    """
-    if clients is None:
-        clients = make_clients()
-
-    swing_rows: List[Dict[str, object]] = []
-    pos_rows: List[Dict[str, object]] = []
-
-    data_str, hora_str = fmt_ts(now_brt())
-
-    for coin in MOEDAS:
-        pair = coin_to_pair(coin)
-        log(f"Processando {coin} ({pair})")
-
-        # Preço atual (base para os dois regimes)
-        price = fetch_price_multi(clients, coin)
-        if price is None or price <= 0:
-            log(f"[WARN] Sem preço para {coin}, pulando.")
-            continue
-
-        # SWING (4H)
-        df_4h = fetch_ohlcv_multi(clients, coin, TF_SWING, limit=200)
-        # POSICIONAL (1D)
-        df_1d = fetch_ohlcv_multi(clients, coin, TF_POS, limit=200)
-
-        if df_4h is None or df_4h.empty or df_1d is None or df_1d.empty:
-            log(f"[WARN] Sem OHLCV suficiente para {coin}, pulando.")
+    for name in ("binance", "bybit"):
+        ex = exs.get(name)
+        if ex is None:
             continue
 
         try:
-            atr_4h = atr(df_4h, period=14)
-            atr_1d = atr(df_1d, period=14)
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if not ohlcv:
+                errors.append(f"{name}: resposta vazia")
+                continue
 
-            ema_fast_4h = ema(df_4h["close"], period=20)
-            ema_slow_4h = ema(df_4h["close"], period=50)
-            ema_long_4h = ema(df_4h["close"], period=200)
+            df = pd.DataFrame(
+                ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+            # converte timestamp para datetime
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df.set_index("timestamp", inplace=True)
+            df = df.tz_convert(TZINFO)
 
-            side = decide_side(ema_fast_4h, ema_slow_4h, ema_long_4h)
+            return df
         except Exception as e:  # noqa: BLE001
-            log(f"[ERRO] Cálculo de indicadores para {coin}: {e}")
+            errors.append(f"{name}: {e!r}")
             continue
 
-        # SWING
-        alvo_swing, ganho_swing, assert_swing = compute_target_and_prob(
-            price, atr_4h, regime="SWING", side=side
-        )
-        row_swing = {
-            "par": coin,
-            "sinal": side,
-            "preco": round(price, PRICE_DECIMALS),
-            "alvo": round(alvo_swing, PRICE_DECIMALS),
-            "ganho_pct": round(ganho_swing, PCT_DECIMALS),
-            "assert_pct": round(assert_swing, PCT_DECIMALS),
-            "data": data_str,
-            "hora": hora_str,
-        }
-        swing_rows.append(row_swing)
-
-        # POSICIONAL
-        alvo_pos, ganho_pos, assert_pos = compute_target_and_prob(
-            price, atr_1d, regime="POSICIONAL", side=side
-        )
-        row_pos = {
-            "par": coin,
-            "sinal": side,
-            "preco": round(price, PRICE_DECIMALS),
-            "alvo": round(alvo_pos, PRICE_DECIMALS),
-            "ganho_pct": round(ganho_pos, PCT_DECIMALS),
-            "assert_pct": round(assert_pos, PCT_DECIMALS),
-            "data": data_str,
-            "hora": hora_str,
-        }
-        pos_rows.append(row_pos)
-
-    log(f"[OK] Engine gerou {len(swing_rows)} sinais Swing e {len(pos_rows)} sinais Posicional.")
-    return {"swing": swing_rows, "posicional": pos_rows}
+    log(f"Falha ao buscar OHLCV para {symbol} {timeframe}: {' | '.join(errors)}")
+    return None
 
 
 # ============================
-# I/O DO ARQUIVO JSON
+# CÁLCULOS DOS SINAIS
 # ============================
 
-def salvar_json(payload: Dict[str, List[Dict[str, object]]]) -> None:
-    path = ENTRADA_JSON_PATH
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-    log(
-        f"[OK] Atualizado {path} com {len(payload.get('swing', []))} Swing "
-        f"e {len(payload.get('posicional', []))} Posicional."
+
+def calcular_sinal_para_df(
+    coin: str,
+    df: pd.DataFrame,
+    modo: str,
+) -> Optional[SinalEntrada]:
+    """
+    Calcula o sinal (LONG/SHORT), alvo, ganho % e assert % para uma moeda,
+    dado um DataFrame de candles já carregado.
+
+    `modo` deve ser "swing" ou "posicional".
+    """
+    if df.shape[0] < 60:
+        log(f"{coin} modo={modo}: poucos candles ({df.shape[0]}), pulando.")
+        return None
+
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+
+    # EMAs para direção de tendência
+    ema_fast = EMAIndicator(close=close, window=9).ema_indicator()
+    ema_slow = EMAIndicator(close=close, window=21).ema_indicator()
+
+    # ATR para volatilidade
+    atr = AverageTrueRange(
+        high=high,
+        low=low,
+        close=close,
+        window=14,
+    ).average_true_range()
+
+    # ADX para medir força da tendência
+    adx = ADXIndicator(
+        high=high,
+        low=low,
+        close=close,
+        window=14,
+    ).adx()
+
+    last_close = float(close.iloc[-1])
+    last_ema_fast = float(ema_fast.iloc[-1])
+    last_ema_slow = float(ema_slow.iloc[-1])
+    last_atr = float(atr.iloc[-1])
+    last_adx = float(adx.iloc[-1])
+
+    if not all(math.isfinite(x) for x in [last_close, last_ema_fast, last_ema_slow, last_atr, last_adx]):
+        log(f"{coin} modo={modo}: valores não finitos, pulando.")
+        return None
+
+    # Direção: LONG se EMA rápida acima da lenta; caso contrário, SHORT.
+    if last_ema_fast > last_ema_slow:
+        sinal = "LONG"
+    else:
+        sinal = "SHORT"
+
+    # ATR em % do preço (volatilidade relativa)
+    atr_pct = (last_atr / last_close) * 100.0
+
+    # Regras diferentes para Swing vs Posicional
+    if modo == "swing":
+        atr_mult = ATR_MULT_SWING
+        base_assert = 68.0  # base aproximada para swing
+    else:
+        atr_mult = ATR_MULT_POS
+        base_assert = 72.0  # base aproximada para posicional
+
+    # Ganho bruto em % a partir da volatilidade
+    ganho_pct_raw = atr_pct * atr_mult
+
+    # Pelo menos 3% de alvo
+    ganho_pct_raw = max(ganho_pct_raw, MIN_GANHO)
+
+    # Cap superior de alvo (para evitar números absurdos)
+    ganho_pct_raw = min(ganho_pct_raw, 25.0)
+
+    # Preço alvo
+    if sinal == "LONG":
+        alvo = last_close * (1.0 + ganho_pct_raw / 100.0)
+    else:  # SHORT
+        alvo = last_close * (1.0 - ganho_pct_raw / 100.0)
+
+    # Recalcula ganho real a partir do alvo (só por segurança)
+    if sinal == "LONG":
+        ganho_pct_real = ((alvo - last_close) / last_close) * 100.0
+    else:
+        ganho_pct_real = ((last_close - alvo) / last_close) * 100.0
+
+    # ASSERT % individual:
+    # - parte da ADX (força de tendência)
+    # - parte da "alinhamento" entre sinal e EMAs
+    tendencia_score = 0.0
+    if sinal == "LONG" and last_ema_fast > last_ema_slow:
+        tendencia_score += 3.0
+    elif sinal == "SHORT" and last_ema_fast < last_ema_slow:
+        tendencia_score += 3.0
+    else:
+        tendencia_score -= 3.0
+
+    # ADX > 25 indica tendência mais forte.
+    adx_bonus = max(0.0, (last_adx - 25.0) / 5.0)
+    assert_pct = base_assert + tendencia_score + adx_bonus
+
+    # Clamp final da assertividade
+    assert_pct = max(MIN_ASSERT_CLAMP, min(MAX_ASSERT_CLAMP, assert_pct))
+
+    # Aplica filtros mínimos
+    if ganho_pct_real < MIN_GANHO or assert_pct < MIN_ASSERT:
+        # Sinal não aprovado; não publica.
+        log(
+            f"{coin} modo={modo}: filtrado (ganho={ganho_pct_real:.2f}%, "
+            f"assert={assert_pct:.2f}%)."
+        )
+        return None
+
+    # Arredondamentos finais
+    preco_r = round(last_close, PRICE_DECIMALS)
+    alvo_r = round(alvo, PRICE_DECIMALS)
+    ganho_r = round(ganho_pct_real, PCT_DECIMALS)
+    assert_r = round(assert_pct, PCT_DECIMALS)
+
+    ts = now_brt()
+    data_str = ts.strftime("%Y-%m-%d")
+    hora_str = ts.strftime("%H:%M")
+
+    return SinalEntrada(
+        par=coin,
+        sinal=sinal,
+        preco=preco_r,
+        alvo=alvo_r,
+        ganho_pct=ganho_r,
+        assert_pct=assert_r,
+        data=data_str,
+        hora=hora_str,
     )
 
 
+def gerar_sinais() -> Dict[str, object]:
+    """
+    Gera todos os sinais Swing e Posicional para o universo de moedas.
+    Retorna um dicionário pronto para ser salvo em JSON.
+    """
+    exs = criar_exchanges()
+    swing: List[SinalEntrada] = []
+    posicional: List[SinalEntrada] = []
+
+    log(f"Gerando sinais para {len(COINS)} moedas...")
+
+    for coin in COINS:
+        symbol = coin_to_pair(coin)
+
+        # -------- Swing (4H)
+        df4 = fetch_ohlcv_any(exs, symbol, TF_SWING, limit=200)
+        if df4 is not None:
+            sinal_swing = calcular_sinal_para_df(coin, df4, modo="swing")
+            if sinal_swing is not None:
+                swing.append(sinal_swing)
+
+        # -------- Posicional (1D)
+        df1d = fetch_ohlcv_any(exs, symbol, TF_POS, limit=200)
+        if df1d is not None:
+            sinal_pos = calcular_sinal_para_df(coin, df1d, modo="posicional")
+            if sinal_pos is not None:
+                posicional.append(sinal_pos)
+
+    # Ordena alfabeticamente por par
+    swing_sorted = sorted(swing, key=lambda s: s.par)
+    pos_sorted = sorted(posicional, key=lambda s: s.par)
+
+    payload = {
+        "generated_at": now_brt().isoformat(),
+        "swing": [asdict(s) for s in swing_sorted],
+        "posicional": [asdict(s) for s in pos_sorted],
+    }
+
+    log(
+        "Sinais gerados: "
+        f"{len(swing_sorted)} swing, {len(pos_sorted)} posicional."
+    )
+    return payload
+
+
+def salvar_json(payload: Dict[str, object]) -> None:
+    """Salva o payload no arquivo ENTRADA_JSON_PATH."""
+    tmp_path = ENTRADA_JSON_PATH + ".tmp"
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    os.replace(tmp_path, ENTRADA_JSON_PATH)
+    log(f"Arquivo salvo em: {ENTRADA_JSON_PATH}")
+
+
 def main() -> None:
-    log("Iniciando worker_entrada.py")
+    log("Iniciando worker_entrada.py...")
     payload = gerar_sinais()
     salvar_json(payload)
-    log("worker_entrada.py finalizado.")
+    log("worker_entrada.py finalizado com sucesso.")
 
 
 if __name__ == "__main__":
