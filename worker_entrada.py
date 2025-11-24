@@ -5,7 +5,8 @@ worker_entrada.py  (MODO DEMO REALISTA USANDO exchanges.get_ohlcv)
 - Usa dados REAIS das corretoras que já funcionam no projeto (KuCoin, Gate.io, OKX),
   através da função get_ohlcv() do módulo exchanges.py.
 - NÃO usa Binance / Bybit diretamente.
-- NÃO usa valores iguais para todas as moedas.
+- NÃO usa ccxt.
+- NÃO gera valores iguais para todas as moedas.
 - Calcula ATR 4H (Swing) e ATR 1D (Posicional).
 - Calcula PREÇO ALVO primeiro e depois GANHO %.
 - Aplica filtros para gerar sinal "NAO ENTRAR" quando:
