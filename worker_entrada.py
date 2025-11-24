@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-worker_entrada.py  (MODO REAL)
+worker_entrada.py  (MODO DEMO REALISTA USANDO exchanges.get_ohlcv)
 
-- Usa dados REAIS das corretoras (Binance + Bybit).
-- NÃO usa versão demo.
-- NÃO gera valores iguais para todas as moedas.
+- Usa dados REAIS das corretoras que já funcionam no projeto (KuCoin, Gate.io, OKX),
+  através da função get_ohlcv() do módulo exchanges.py.
+- NÃO usa Binance / Bybit diretamente.
+- NÃO usa valores iguais para todas as moedas.
 - Calcula ATR 4H (Swing) e ATR 1D (Posicional).
 - Calcula PREÇO ALVO primeiro e depois GANHO %.
 - Aplica filtros para gerar sinal "NAO ENTRAR" quando:
@@ -19,20 +20,18 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
-import ccxt  # type: ignore
-
-from config import TZINFO, PRICE_DECIMALS, PCT_DECIMALS  # type: ignore
+from config import PCT_DECIMALS, PRICE_DECIMALS, TZINFO
+from exchanges import get_ohlcv
 
 # ======================================================================
 # CONFIGURAÇÕES GERAIS
 # ======================================================================
 
-# Universo fixo de moedas (sem USDT)
-COINS = sorted(
+COINS: List[str] = sorted(
     [
         "AAVE",
         "ADA",
@@ -76,12 +75,12 @@ COINS = sorted(
     ]
 )
 
-# Caminho do JSON usado pelo backend (mesmo do server.js)
+# Caminho do JSON usado pelo backend (server.js usa o mesmo padrão)
 ENTRADA_JSON_PATH = os.getenv("ENTRADA_JSON_PATH", "entrada.json")
 
-# Quantidade de candles para cálculo de ATR e assertividade
-CANDLES_SWING = 120   # 4h
-CANDLES_POSICIONAL = 200  # 1d
+# Quantidade de candles para cálculo
+CANDLES_SWING = 120      # 4h
+CANDLES_POSICIONAL = 200 # 1d
 
 # Critérios mínimos para publicar sinal
 MIN_GAIN_PCT = 3.0
@@ -111,96 +110,39 @@ def _now_brt() -> datetime:
 
 def _log(msg: str) -> None:
     ts = _now_brt().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [worker_entrada_real] {msg}", flush=True)
+    print(f"[{ts}] [worker_entrada] {msg}", flush=True)
 
 
-def _create_exchanges() -> Dict[str, ccxt.Exchange]:
+def _ohlcv_from_df(coin: str, timeframe: str, limit: int) -> List[List[float]]:
     """
-    Cria instâncias das corretoras principais.
-
-    Estratégia:
-    - Usamos Binance como principal.
-    - Usamos Bybit como backup.
+    Usa exchanges.get_ohlcv() para obter um DataFrame e converte para
+    lista de candles [ts, open, high, low, close, volume] compatível
+    com as funções de ATR / assertividade.
     """
-    binance = ccxt.binance(
-        {
-            "enableRateLimit": True,
-            "options": {"adjustForTimeDifference": True},
-        }
-    )
-    bybit = ccxt.bybit(
-        {
-            "enableRateLimit": True,
-            "options": {"adjustForTimeDifference": True},
-        }
-    )
+    df = get_ohlcv(coin, timeframe, limit=limit)
+    if df is None or df.empty:
+        raise RuntimeError(f"Sem OHLCV para {coin} {timeframe}")
 
-    # Faz um ping rápido para sincronizar tempo (não é obrigatório, mas ajuda)
-    try:
-        binance.load_markets()
-        _log("Mercados carregados (Binance).")
-    except Exception as e:  # noqa: BLE001
-        _log(f"ATENÇÃO: erro ao carregar mercados Binance: {e}")
-
-    try:
-        bybit.load_markets()
-        _log("Mercados carregados (Bybit).")
-    except Exception as e:  # noqa: BLE001
-        _log(f"ATENÇÃO: erro ao carregar mercados Bybit: {e}")
-
-    return {"binance": binance, "bybit": bybit}
-
-
-def _build_symbol(coin: str) -> str:
-    """
-    Constrói o símbolo padrão da moeda.
-
-    Ex: "BTC" -> "BTC/USDT"
-    """
-    return f"{coin}/USDT"
-
-
-def _fetch_ohlcv_with_fallback(
-    exchanges: Dict[str, ccxt.Exchange],
-    symbol: str,
-    timeframe: str,
-    limit: int,
-) -> List[List[float]]:
-    """
-    Busca OHLCV usando:
-    1) Binance como principal
-    2) Bybit como backup
-
-    Sempre retorna uma lista de candles ou lança exceção.
-    """
-    err_msgs = []
-
-    for name in ("binance", "bybit"):
-        ex = exchanges.get(name)
-        if ex is None:
-            continue
-        try:
-            _log(f"Buscando OHLCV em {name} para {symbol} tf={timeframe}, limit={limit}...")
-            ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            if not ohlcv:
-                raise RuntimeError("lista vazia")
-            _log(f"OK {name}: recebidos {len(ohlcv)} candles para {symbol} ({timeframe}).")
-            return ohlcv
-        except Exception as e:  # noqa: BLE001
-            msg = f"{name}: erro ao buscar OHLCV para {symbol} ({timeframe}): {e}"
-            _log(msg)
-            err_msgs.append(msg)
-            # pequena pausa antes de tentar próxima corretora
-            time.sleep(0.5)
-
-    raise RuntimeError("Falha ao buscar OHLCV em todas as corretoras: " + " | ".join(err_msgs))
+    df2 = df.tail(limit)
+    ohlcv: List[List[float]] = []
+    for ts, row in df2.iterrows():
+        ms = int(ts.timestamp() * 1000.0)
+        ohlcv.append(
+            [
+                ms,
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+                float(row["volume"]),
+            ]
+        )
+    return ohlcv
 
 
 def _calc_atr(ohlcv: List[List[float]], period: int = 14) -> float:
     """
     Calcula ATR (Average True Range) simples com base em candles OHLCV.
-
-    Cada candle: [timestamp, open, high, low, close, volume]
     """
     if len(ohlcv) < period + 1:
         raise ValueError(f"Poucos candles para ATR: {len(ohlcv)} < {period + 1}")
@@ -224,26 +166,24 @@ def _calc_atr(ohlcv: List[List[float]], period: int = 14) -> float:
     if not trs:
         raise ValueError("Lista de TR vazia ao calcular ATR.")
 
-    # Média simples dos últimos "period" TRs
     last_trs = trs[-period:]
     atr = sum(last_trs) / float(len(last_trs))
     return atr
 
 
-def _calc_assertividade(ohlcv: List[List[float]], step: int = 5, max_barras: int = 60) -> float:
+def _calc_assertividade(
+    ohlcv: List[List[float]],
+    step: int = 5,
+    max_barras: int = 60,
+) -> float:
     """
     Mede uma "assertividade" simples baseada na direção dos fechamentos.
-
-    Lógica:
-    - Compara fechamento atual com fechamento de 'step' barras atrás.
-    - Conta quantas vezes houve "acerto" no sentido da tendência.
-    - Converte para um percentual entre ~60% e ~85% (ajustado).
     """
     closes = [float(c[4]) for c in ohlcv]
     n = len(closes)
 
     if n <= step:
-        return 70.0  # fallback razoável
+        return 70.0  # fallback
 
     wins = 0
     total = 0
@@ -259,27 +199,21 @@ def _calc_assertividade(ohlcv: List[List[float]], step: int = 5, max_barras: int
     if total == 0:
         return 70.0
 
-    base = wins / total  # 0..1
-    # Normaliza em torno de 0.7 com amplitude controlada
-    pct = 60.0 + (base - 0.5) * 50.0  # de ~35 a ~85
+    base = wins / total
+    pct = 60.0 + (base - 0.5) * 50.0
     pct = max(50.0, min(85.0, pct))
     return pct
 
 
-def _gerar_sinal_para_moeda(
-    exchanges: Dict[str, ccxt.Exchange],
-    coin: str,
-    modo: str,
-) -> SinalEntrada:
-    """
-    Gera o sinal REAL para uma única moeda e um único modo.
+# ======================================================================
+# GERAÇÃO DE SINAL POR MOEDA
+# ======================================================================
 
-    modo:
-    - "swing"      -> timeframe 4h, ATR menor
-    - "posicional" -> timeframe 1d, ATR maior
-    """
-    symbol = _build_symbol(coin)
 
+def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
+    """
+    Gera o sinal para uma única moeda e um único modo (swing/posicional).
+    """
     if modo == "swing":
         timeframe = "4h"
         limit = CANDLES_SWING
@@ -287,19 +221,16 @@ def _gerar_sinal_para_moeda(
     elif modo == "posicional":
         timeframe = "1d"
         limit = CANDLES_POSICIONAL
-        atr_mult = 2.0
+        atr_mult = 1.5
     else:
-        raise ValueError(f"Modo desconhecido: {modo}")
+        raise ValueError(f"Modo inválido: {modo}")
 
-    ohlcv = _fetch_ohlcv_with_fallback(exchanges, symbol, timeframe, limit)
+    ohlcv = _ohlcv_from_df(coin, timeframe, limit)
+
     if not ohlcv:
-        raise RuntimeError(f"Nenhum OHLCV retornado para {symbol} ({timeframe}).")
+        raise RuntimeError(f"Nenhum candle para {coin} ({timeframe})")
 
-    # Preço atual = fechamento do último candle
-    ultimo = ohlcv[-1]
-    preco_atual = float(ultimo[4])
-
-    # Tendência simples: compara com fechamento 5 candles atrás
+    preco_atual = float(ohlcv[-1][4])
     ref_index = max(0, len(ohlcv) - 6)
     preco_ref = float(ohlcv[ref_index][4])
 
@@ -308,25 +239,17 @@ def _gerar_sinal_para_moeda(
     else:
         sinal = "SHORT"
 
-    # Calcula ATR
     atr = _calc_atr(ohlcv, period=14)
 
-    # Calcula preço ALVO com base em ATR
     if sinal == "LONG":
         alvo = preco_atual + atr * atr_mult
         ganho_pct = (alvo / preco_atual - 1.0) * 100.0
-    elif sinal == "SHORT":
+    else:  # SHORT
         alvo = max(0.0, preco_atual - atr * atr_mult)
         ganho_pct = (preco_atual / alvo - 1.0) * 100.0 if alvo > 0 else 0.0
-    else:
-        # fallback (não deve cair aqui)
-        alvo = preco_atual
-        ganho_pct = 0.0
 
-    # Calcula assertividade
     assert_pct = _calc_assertividade(ohlcv)
 
-    # Aplica filtros: se não atender critérios, vira "NAO ENTRAR"
     if ganho_pct < MIN_GAIN_PCT or assert_pct < MIN_ASSERT_PCT:
         sinal_final = "NAO ENTRAR"
         alvo_final = preco_atual
@@ -352,15 +275,15 @@ def _gerar_sinal_para_moeda(
     )
 
 
-def _gerar_sinais_por_modo(exchanges: Dict[str, ccxt.Exchange], modo: str) -> List[SinalEntrada]:
+def _gerar_sinais_por_modo(modo: str) -> List[SinalEntrada]:
     resultados: List[SinalEntrada] = []
+
     for coin in COINS:
         try:
-            sinal = _gerar_sinal_para_moeda(exchanges, coin, modo)
+            sinal = _gerar_sinal_para_moeda(coin, modo)
             resultados.append(sinal)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             _log(f"ERRO ao gerar sinal para {coin} (modo={modo}): {e}")
-            # Em caso de erro, registramos um "NAO ENTRAR" para não ficar vazio
             ts = _now_brt()
             data_str = ts.strftime("%Y-%m-%d")
             hora_str = ts.strftime("%H:%M")
@@ -377,17 +300,18 @@ def _gerar_sinais_por_modo(exchanges: Dict[str, ccxt.Exchange], modo: str) -> Li
                 )
             )
 
+        time.sleep(0.2)
+
     resultados.sort(key=lambda s: s.par)
     _log(f"Sinais gerados para modo={modo}: {len(resultados)} moedas.")
     return resultados
 
 
-def gerar_sinais_reais() -> Dict[str, object]:
-    _log("Iniciando geração de sinais REAIS (Binance + Bybit)...")
-    exchanges = _create_exchanges()
+def gerar_sinais() -> Dict[str, object]:
+    _log("Iniciando geração de sinais (KuCoin/Gate/OKX via exchanges.get_ohlcv)...")
 
-    swing = _gerar_sinais_por_modo(exchanges, "swing")
-    posicional = _gerar_sinais_por_modo(exchanges, "posicional")
+    swing = _gerar_sinais_por_modo("swing")
+    posicional = _gerar_sinais_por_modo("posicional")
 
     payload = {
         "generated_at": _now_brt().isoformat(),
@@ -396,28 +320,25 @@ def gerar_sinais_reais() -> Dict[str, object]:
     }
 
     _log(
-        f"Sinais REAIS gerados: {len(payload['swing'])} swing, "
+        f"Sinais gerados: {len(payload['swing'])} swing, "
         f"{len(payload['posicional'])} posicional."
     )
     return payload
 
 
 def salvar_json(payload: Dict[str, object]) -> None:
-    """
-    Salva JSON em caminho temporário e depois faz replace atômico.
-    """
-    tmp_path = ENTRADA_JSON_PATH + ".tmp"
+    tmp_path = f"{ENTRADA_JSON_PATH}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, ENTRADA_JSON_PATH)
-    _log(f"Arquivo salvo em: {ENTRADA_JSON_PATH}")
+    _log(f"Arquivo atualizado: {ENTRADA_JSON_PATH}")
 
 
 def main() -> None:
-    _log("Executando worker_entrada REAL (Binance + Bybit)...")
-    payload = gerar_sinais_reais()
+    _log("Executando worker_entrada (modo DEMO REALISTA)...")
+    payload = gerar_sinais()
     salvar_json(payload)
-    _log("worker_entrada REAL finalizado com sucesso.")
+    _log("worker_entrada finalizado com sucesso.")
 
 
 if __name__ == "__main__":
