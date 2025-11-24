@@ -28,10 +28,6 @@ from typing import Dict, List
 from config import PCT_DECIMALS, PRICE_DECIMALS, TZINFO
 from exchanges import get_ohlcv
 
-# ======================================================================
-# CONFIGURAÇÕES GERAIS
-# ======================================================================
-
 COINS: List[str] = sorted(
     [
         "AAVE",
@@ -76,14 +72,11 @@ COINS: List[str] = sorted(
     ]
 )
 
-# Caminho do JSON usado pelo backend (server.js usa o mesmo padrão)
 ENTRADA_JSON_PATH = os.getenv("ENTRADA_JSON_PATH", "entrada.json")
 
-# Quantidade de candles para cálculo
 CANDLES_SWING = 120      # 4h
 CANDLES_POSICIONAL = 200 # 1d
 
-# Critérios mínimos para publicar sinal
 MIN_GAIN_PCT = 3.0
 MIN_ASSERT_PCT = 65.0
 
@@ -91,18 +84,13 @@ MIN_ASSERT_PCT = 65.0
 @dataclass
 class SinalEntrada:
     par: str
-    sinal: str  # "LONG", "SHORT" ou "NAO ENTRAR"
+    sinal: str
     preco: float
     alvo: float
     ganho_pct: float
     assert_pct: float
     data: str
     hora: str
-
-
-# ======================================================================
-# FUNÇÕES DE APOIO
-# ======================================================================
 
 
 def _now_brt() -> datetime:
@@ -115,11 +103,6 @@ def _log(msg: str) -> None:
 
 
 def _ohlcv_from_df(coin: str, timeframe: str, limit: int) -> List[List[float]]:
-    """
-    Usa exchanges.get_ohlcv() para obter um DataFrame e converte para
-    lista de candles [ts, open, high, low, close, volume] compatível
-    com as funções de ATR / assertividade.
-    """
     df = get_ohlcv(coin, timeframe, limit=limit)
     if df is None or df.empty:
         raise RuntimeError(f"Sem OHLCV para {coin} {timeframe}")
@@ -142,11 +125,8 @@ def _ohlcv_from_df(coin: str, timeframe: str, limit: int) -> List[List[float]]:
 
 
 def _calc_atr(ohlcv: List[List[float]], period: int = 14) -> float:
-    """
-    Calcula ATR (Average True Range) simples com base em candles OHLCV.
-    """
     if len(ohlcv) < period + 1:
-        raise ValueError(f"Poucos candles para ATR: {len(ohlcv)} < {period + 1}")
+        raise ValueError(f"Poucos candles para ATR: len={len(ohlcv)} < {period + 1}")
 
     trs: List[float] = []
     prev_close = float(ohlcv[0][4])
@@ -164,9 +144,6 @@ def _calc_atr(ohlcv: List[List[float]], period: int = 14) -> float:
         trs.append(tr)
         prev_close = close
 
-    if not trs:
-        raise ValueError("Lista de TR vazia ao calcular ATR.")
-
     last_trs = trs[-period:]
     atr = sum(last_trs) / float(len(last_trs))
     return atr
@@ -177,14 +154,11 @@ def _calc_assertividade(
     step: int = 5,
     max_barras: int = 60,
 ) -> float:
-    """
-    Mede uma "assertividade" simples baseada na direção dos fechamentos.
-    """
     closes = [float(c[4]) for c in ohlcv]
     n = len(closes)
 
     if n <= step:
-        return 70.0  # fallback
+        return 70.0
 
     wins = 0
     total = 0
@@ -206,15 +180,7 @@ def _calc_assertividade(
     return pct
 
 
-# ======================================================================
-# GERAÇÃO DE SINAL POR MOEDA
-# ======================================================================
-
-
 def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
-    """
-    Gera o sinal para uma única moeda e um único modo (swing/posicional).
-    """
     if modo == "swing":
         timeframe = "4h"
         limit = CANDLES_SWING
@@ -227,7 +193,6 @@ def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
         raise ValueError(f"Modo inválido: {modo}")
 
     ohlcv = _ohlcv_from_df(coin, timeframe, limit)
-
     if not ohlcv:
         raise RuntimeError(f"Nenhum candle para {coin} ({timeframe})")
 
@@ -245,7 +210,7 @@ def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
     if sinal == "LONG":
         alvo = preco_atual + atr * atr_mult
         ganho_pct = (alvo / preco_atual - 1.0) * 100.0
-    else:  # SHORT
+    else:
         alvo = max(0.0, preco_atual - atr * atr_mult)
         ganho_pct = (preco_atual / alvo - 1.0) * 100.0 if alvo > 0 else 0.0
 
@@ -300,7 +265,6 @@ def _gerar_sinais_por_modo(modo: str) -> List[SinalEntrada]:
                     hora=hora_str,
                 )
             )
-
         time.sleep(0.2)
 
     resultados.sort(key=lambda s: s.par)
