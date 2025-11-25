@@ -1,10 +1,28 @@
-#!/bin/bash
-cd /home/roteiro_ds/autotrader-planilhas-python
-source venv/bin/activate
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Diretório do projeto na VM
+PROJECT_DIR="/home/roteiro_ds/autotrader-planilhas-python"
+VENV_DIR="$PROJECT_DIR/venv"
+LOG_FILE="$PROJECT_DIR/worker_entrada_cron.log"
+
+cd "$PROJECT_DIR"
+
+# Ativa o ambiente virtual, se existir
+if [ -d "$VENV_DIR" ]; then
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+fi
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Iniciando loop contínuo do worker_entrada..." >> "$LOG_FILE"
 
 while true; do
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Rodando worker_entrada.py REAL..."
-  python worker_entrada.py
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Aguardando 5 minutos..."
-  sleep 300
+  TS="$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "[$TS] Executando worker_entrada..." >> "$LOG_FILE"
+
+  # Executa o worker e registra saída no log
+  python worker_entrada.py >> "$LOG_FILE" 2>&1 || echo "[$TS] ERRO na execução do worker_entrada.py" >> "$LOG_FILE"
+
+  # Intervalo entre execuções (segundos)
+  sleep 15
 done
