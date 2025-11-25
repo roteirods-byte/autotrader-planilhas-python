@@ -1,456 +1,494 @@
 #!/usr/bin/env python3
 """
-worker_entrada.py
+worker_entrada.py  (MODO REAL, FIBO PROFISSIONAL)
 
-Gerador de sinais para o PAINEL ENTRADA (Swing 4H e Posicional 1D).
+- Usa dados REAIS das corretoras (Binance + Bybit) via ccxt.
+- Calcula sinais para:
+    * SWING  (4H)
+    * POSICIONAL (1D)
+- Para cada moeda e modo:
+    * Calcula ATR, EMAs, ADX, swing high/low recentes.
+    * Calcula 3 ALVOS (Fibonacci + ATR):
+        - ALVO_1, ALVO_2, ALVO_3
+        - GANHO_1_PCT, GANHO_2_PCT, GANHO_3_PCT.
+    * Define a direção base:
+        - LONG  (tendência de alta)
+        - SHORT (tendência de baixa)
+    * Define o sinal final:
+        - se GANHO_1_PCT < 3.0 → "NAO ENTRAR"
+        - se GANHO_1_PCT >= 3.0 → LONG ou SHORT
 
-Modelo:
-
-- Usa OHLCV real via exchanges.get_ohlcv().
-- Calcula EMAs (20/50) para tendência.
-- Calcula ATR(14) para volatilidade.
-- Usa variação de 24h (1d) como reforço de direção.
-- Calcula alvo em múltiplos de ATR (apenas volatilidade, sem mínimo artificial).
-- Calcula assertividade simples via backtest:
-  * quantas vezes o preço andou >= MIN_GAIN_PCT na direção do setup,
-    dentro de um horizonte de candles.
-- Sempre preenche PREÇO, ALVO, GANHO%, ASSERT% para todas as moedas
-  que tiverem dados.
-
-REGRAS PEDIDAS PELO JORGE:
-
-- SINAL:
-    * Se GANHO% >= MIN_GAIN_PCT (3.0 por padrão) -> SINAL = LONG ou SHORT.
-    * Se GANHO% < MIN_GAIN_PCT -> SINAL = "NAO ENTRAR".
-- ASSERTIVIDADE:
-    * NÃO bloqueia mais a operação, é só informativa (para o painel colorir
-      acima/abaixo de 65%).
+Saída: arquivo JSON entrada.json com campos:
+- par, sinal, preco, alvo, ganho_pct, assert_pct, data, hora
+- campos extras para o painel de SAÍDA:
+  alvo_1, ganho_1_pct, alvo_2, ganho_2_pct, alvo_3, ganho_3_pct, sinal_base
 """
 
 from __future__ import annotations
 
 import json
-import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Literal
+from typing import Dict, List, Optional, Tuple
 
+import ccxt  # type: ignore
+import numpy as np
 import pandas as pd
+import ta  # type: ignore
 
-from config import PCT_DECIMALS, PRICE_DECIMALS, TZINFO
-from exchanges import get_ohlcv
+from config import TZINFO, PRICE_DECIMALS, PCT_DECIMALS
 
-Direction = Literal["LONG", "SHORT"]
+# ====== CONSTANTES DO PROJETO ======
 
-# ======================================================================
-# CONFIGURAÇÕES DO PROJETO
-# ======================================================================
+# Universo fixo de 39 moedas (sem "USDT")
+COINS: List[str] = [
+    "AAVE",
+    "ADA",
+    "APT",
+    "ARB",
+    "ATOM",
+    "AVAX",
+    "AXS",
+    "BCH",
+    "BNB",
+    "BTC",
+    "DOGE",
+    "DOT",
+    "ETH",
+    "FET",
+    "FIL",
+    "FLUX",
+    "ICP",
+    "INJ",
+    "LDO",
+    "LINK",
+    "LTC",
+    "NEAR",
+    "OP",
+    "PEPE",
+    "POL",
+    "RATS",
+    "RENDER",
+    "RUNE",
+    "SEI",
+    "SHIB",
+    "SOL",
+    "SUI",
+    "TIA",
+    "TNSR",
+    "TON",
+    "TRX",
+    "UNI",
+    "WIF",
+    "XRP",
+]
 
-COINS: List[str] = sorted(
-    [
-        "AAVE",
-        "ADA",
-        "APT",
-        "ARB",
-        "ATOM",
-        "AVAX",
-        "AXS",
-        "BCH",
-        "BNB",
-        "BTC",
-        "DOGE",
-        "DOT",
-        "ETH",
-        "FET",
-        "FIL",
-        "FLUX",
-        "ICP",
-        "INJ",
-        "LDO",
-        "LINK",
-        "LTC",
-        "NEAR",
-        "OP",
-        "PEPE",
-        "POL",
-        "RATS",
-        "RENDER",
-        "RUNE",
-        "SEI",
-        "SHIB",
-        "SOL",
-        "SUI",
-        "TIA",
-        "TNSR",
-        "TON",
-        "TRX",
-        "UNI",
-        "WIF",
-        "XRP",
-    ]
-)
+BASE = "USDT"
 
-ENTRADA_JSON_PATH = os.getenv("ENTRADA_JSON_PATH", "entrada.json")
+# Timeframes por modo
+SWING_TIMEFRAME = "4h"
+POSICIONAL_TIMEFRAME = "1d"
+CANDLE_LIMIT = 200  # candles por modo/moeda
 
-# Nº de candles usados em cada modo
-CANDLES_SWING = 200        # timeframe 4h
-CANDLES_POSICIONAL = 260   # timeframe 1d
+# Parâmetros técnicos
+ATR_LEN = 14
+EMA_FAST = 9
+EMA_SLOW = 21
+ADX_LEN = 14
+FIB_LOOKBACK = 55  # candles para swing high/low
+MIN_GAIN_PCT = 3.0  # filtro de NAO ENTRAR baseado em GANHO_1
 
-# Parâmetros do setup
-MIN_GAIN_PCT = 3.0       # lucro mínimo desejado (filtro de entrada)
-MIN_ASSERT_PCT = 65.0    # usado só para cor no painel, NÃO bloqueia entrada
-ATR_MULT_SWING = 2.0     # multiplicador de ATR para alvo swing
-ATR_MULT_POSIC = 2.5     # multiplicador de ATR para alvo posicional
+# Peso da assertividade (tudo 0–1, depois convertemos para %)
+ADX_MIN = 15.0
+ADX_MAX = 40.0
+EMA_DIFF_MAX = 3.0  # % de distância entre EMAs onde saturamos a força
 
-# Janela para assertividade
-ASSERT_HORIZON_SWING = 6     # ~ 1 dia em 4h
-ASSERT_HORIZON_POSIC = 4     # ~ 4 dias em 1d
-ASSERT_MIN_SAMPLES = 8       # mínimo de setups históricos para medir assert
-
-# Cache de variação diária
-_DAILY_CHANGE_CACHE: Dict[str, float] = {}
+# ====== ESTRUTURAS ======
 
 
 @dataclass
-class SinalEntrada:
-    par: str
-    sinal: str  # "LONG", "SHORT" ou "NAO ENTRAR"
-    preco: float
-    alvo: float
-    ganho_pct: float
-    assert_pct: float
-    data: str
-    hora: str
+class IndicatorContext:
+    price: float
+    atr: float
+    ema_fast: float
+    ema_slow: float
+    adx: float
+    swing_high: float
+    swing_low: float
 
 
-# ======================================================================
-# FUNÇÕES AUXILIARES
-# ======================================================================
+@dataclass
+class Targets:
+    alvo_1: float
+    alvo_2: float
+    alvo_3: float
+    ganho_1_pct: float
+    ganho_2_pct: float
+    ganho_3_pct: float
 
 
-def _now_brt() -> datetime:
-    return datetime.now(TZINFO)
+# ====== LOG SIMPLES ======
 
 
 def _log(msg: str) -> None:
-    ts = _now_brt().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [worker_entrada] {msg}", flush=True)
+    now = datetime.now(TZINFO).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {msg}", flush=True)
 
 
-def _load_ohlcv_df(coin: str, timeframe: str, limit: int) -> pd.DataFrame:
-    df = get_ohlcv(coin, timeframe, limit=limit)
-    if df is None or df.empty:
-        raise RuntimeError(f"Sem OHLCV para {coin} timeframe={timeframe}")
-    df = df.sort_index()
-    return df
+# ====== EXCHANGES (BINANCE + BYBIT) ======
 
 
-def _add_indicators(
-    df: pd.DataFrame,
-    ema_fast: int = 20,
-    ema_slow: int = 50,
-    atr_period: int = 14,
-) -> pd.DataFrame:
-    df = df.copy()
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-
-    df["ema_fast"] = close.ewm(span=ema_fast, adjust=False).mean()
-    df["ema_slow"] = close.ewm(span=ema_slow, adjust=False).mean()
-
-    prev_close = close.shift(1)
-    tr1 = (high - low).abs()
-    tr2 = (high - prev_close).abs()
-    tr3 = (prev_close - low).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(window=atr_period, min_periods=atr_period).mean()
-
-    return df.dropna()
-
-
-def _get_daily_change_24h(coin: str) -> float:
+def create_exchanges() -> Dict[str, ccxt.Exchange]:
     """
-    Variação % de 24h com base em candles 1d (close contra close anterior).
+    Cria instâncias de Binance e Bybit com rate limit habilitado.
     """
-    if coin in _DAILY_CHANGE_CACHE:
-        return _DAILY_CHANGE_CACHE[coin]
-
-    df = get_ohlcv(coin, "1d", limit=40)
-    if df is None or df.empty or len(df) < 2:
-        _DAILY_CHANGE_CACHE[coin] = 0.0
-        return 0.0
-
-    df = df.sort_index()
-    last = float(df["close"].iloc[-1])
-    prev = float(df["close"].iloc[-2])
-    change_pct = (last / prev - 1.0) * 100.0
-    _DAILY_CHANGE_CACHE[coin] = change_pct
-    return change_pct
+    _log("Inicializando conexões com Binance e Bybit...")
+    binance = ccxt.binance({"enableRateLimit": True})
+    bybit = ccxt.bybit({"enableRateLimit": True})
+    return {"binance": binance, "bybit": bybit}
 
 
-def _calc_assertividade(
-    df: pd.DataFrame,
-    direction: Direction,
-    min_gain_pct: float,
-    horizon_bars: int,
-) -> float:
+def fetch_ohlcv_with_backup(
+    exchanges: Dict[str, ccxt.Exchange],
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    sleep_between: float = 0.2,
+) -> Optional[List[List[float]]]:
     """
-    Probabilidade histórica do preço andar >= min_gain_pct na direção do setup
-    nos próximos `horizon_bars` candles, condicionado à tendência por EMAs.
-
-    Conceito:
-    - Olha todos os pontos do passado em que:
-        LONG  -> close > ema_fast > ema_slow
-        SHORT -> close < ema_fast < ema_slow
-    - Para cada ponto, mede se nos próximos `horizon_bars` candles o preço
-      andou pelo menos `min_gain_pct` na direção.
-    - ASSERT% = sucessos / tentativas * 100.
+    Tenta buscar OHLCV primeiro na Binance e depois na Bybit.
+    Retorna a lista de candles ou None em caso de falha.
     """
-    closes = df["close"].values
-    ema_fast = df["ema_fast"].values
-    ema_slow = df["ema_slow"].values
-    n = len(df)
-
-    if n <= horizon_bars + 5:
-        return 60.0  # neutro quando histórico é curto
-
-    successes = 0
-    total = 0
-
-    for i in range(n - horizon_bars - 1):
-        price_i = float(closes[i])
-
-        # filtro de tendência semelhante ao estado atual
-        if direction == "LONG":
-            if not (closes[i] > ema_fast[i] > ema_slow[i]):
-                continue
-        else:
-            if not (closes[i] < ema_fast[i] < ema_slow[i]):
-                continue
-
-        future_window = closes[i + 1 : i + 1 + horizon_bars]
-        if future_window.size == 0:
+    errors: List[str] = []
+    for name in ("binance", "bybit"):
+        ex = exchanges.get(name)
+        if ex is None:
+            continue
+        try:
+            _log(f"Buscando OHLCV {symbol} {timeframe} em {name}...")
+            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            time.sleep(sleep_between)
+            return data
+        except Exception as e:  # noqa: BLE001
+            msg = f"{name}: {e!r}"
+            errors.append(msg)
+            _log(f"Erro em {name} para {symbol} {timeframe}: {e!r}")
             continue
 
-        if direction == "LONG":
-            fut_max = float(future_window.max())
-            ret_pct = (fut_max / price_i - 1.0) * 100.0
-        else:
-            fut_min = float(future_window.min())
-            ret_pct = (price_i / fut_min - 1.0) * 100.0
-
-        total += 1
-        if ret_pct >= min_gain_pct:
-            successes += 1
-
-    if total < ASSERT_MIN_SAMPLES:
-        return 60.0
-
-    assert_pct = (successes / total) * 100.0
-    return round(assert_pct, 2)
+    _log(f"FALHA ao buscar OHLCV para {symbol} {timeframe} ({'; '.join(errors)})")
+    return None
 
 
-# ======================================================================
-# GERAÇÃO DE SINAL POR MOEDA / MODO
-# ======================================================================
+# ====== CÁLCULO DE INDICADORES ======
 
 
-def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
+def build_indicator_context(ohlcv: List[List[float]]) -> Optional[IndicatorContext]:
     """
-    Gera o sinal para uma moeda e um modo ("swing" 4h ou "posicional" 1d).
-    Sempre retorna PREÇO, ALVO, GANHO%, ASSERT% quando houver dados.
-    SINAL só é LONG/SHORT quando GANHO% >= MIN_GAIN_PCT.
+    Converte OHLCV em DataFrame e calcula ATR, EMAs, ADX, swing high/low.
     """
+    if not ohlcv or len(ohlcv) < ATR_LEN + 5:
+        return None
 
-    if modo == "swing":
-        timeframe = "4h"
-        limit = CANDLES_SWING
-        atr_mult = ATR_MULT_SWING
-        horizon = ASSERT_HORIZON_SWING
-    elif modo == "posicional":
-        timeframe = "1d"
-        limit = CANDLES_POSICIONAL
-        atr_mult = ATR_MULT_POSIC
-        horizon = ASSERT_HORIZON_POSIC
-    else:
-        raise ValueError(f"Modo inválido: {modo}")
-
-    ts_now = _now_brt()
-    data_str = ts_now.strftime("%Y-%m-%d")
-    hora_str = ts_now.strftime("%H:%M")
-
-    try:
-        df_raw = _load_ohlcv_df(coin, timeframe, limit=limit)
-        df = _add_indicators(df_raw, ema_fast=20, ema_slow=50, atr_period=14)
-    except Exception as e:
-        _log(f"ERRO ao carregar dados de {coin} ({timeframe}): {e}")
-        return SinalEntrada(
-            par=coin,
-            sinal="NAO ENTRAR",
-            preco=0.0,
-            alvo=0.0,
-            ganho_pct=0.0,
-            assert_pct=0.0,
-            data=data_str,
-            hora=hora_str,
-        )
-
-    if df.empty:
-        return SinalEntrada(
-            par=coin,
-            sinal="NAO ENTRAR",
-            preco=0.0,
-            alvo=0.0,
-            ganho_pct=0.0,
-            assert_pct=0.0,
-            data=data_str,
-            hora=hora_str,
-        )
-
-    last = df.iloc[-1]
-    price = float(last["close"])
-    ema_f = float(last["ema_fast"])
-    ema_s = float(last["ema_slow"])
-    atr = float(last["atr"])
-
-    if price <= 0 or atr <= 0:
-        return SinalEntrada(
-            par=coin,
-            sinal="NAO ENTRAR",
-            preco=0.0,
-            alvo=0.0,
-            ganho_pct=0.0,
-            assert_pct=0.0,
-            data=data_str,
-            hora=hora_str,
-        )
-
-    # variação 24h (reforço simples de direção)
-    change_24h = _get_daily_change_24h(coin)
-
-    # Direção principal pelos EMAs; se neutro, usa sinal da variação 24h
-    if price > ema_f > ema_s:
-        direction: Direction = "LONG"
-    elif price < ema_f < ema_s:
-        direction = "SHORT"
-    else:
-        direction = "LONG" if change_24h >= 0 else "SHORT"
-
-    # Assertividade histórica do setup
-    assert_pct = _calc_assertividade(
-        df=df,
-        direction=direction,
-        min_gain_pct=MIN_GAIN_PCT,
-        horizon_bars=horizon,
+    df = pd.DataFrame(
+        ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
+    df["timestamp"] = (
+        pd.to_datetime(df["timestamp"], unit="ms")
+        .dt.tz_localize("UTC")
+        .dt.tz_convert(TZINFO)
     )
 
-    # ==========================================================
-    # CÁLCULO DO ALVO (CORRIGIDO):
-    # - ATR_MULT * ATR -> alvo "natural" pela volatilidade.
-    # - NÃO usa mais max(..., MIN_GAIN_PCT).
-    #   O mínimo de ganho é filtro, não entra na fórmula do alvo.
-    # ==========================================================
-    atr_pct = (atr / price) * 100.0
-    alvo_pct = atr_mult * atr_pct
-    ganho_pct = round(alvo_pct, PCT_DECIMALS)
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
 
-    if direction == "LONG":
-        alvo = price * (1.0 + alvo_pct / 100.0)
-    else:
-        alvo = price * (1.0 - alvo_pct / 100.0)
+    # ATR
+    atr_ind = ta.volatility.AverageTrueRange(
+        high=high, low=low, close=close, window=ATR_LEN
+    )
+    df["atr"] = atr_ind.average_true_range()
 
-    alvo = round(alvo, PRICE_DECIMALS)
-    preco_fmt = round(price, PRICE_DECIMALS)
+    # EMAs
+    ema_fast_ind = ta.trend.EMAIndicator(close=close, window=EMA_FAST)
+    ema_slow_ind = ta.trend.EMAIndicator(close=close, window=EMA_SLOW)
+    df["ema_fast"] = ema_fast_ind.ema_indicator()
+    df["ema_slow"] = ema_slow_ind.ema_indicator()
 
-    # REGRA FINAL DO SINAL:
-    # Se GANHO% >= MIN_GAIN_PCT -> LONG/SHORT
-    # Se GANHO% < MIN_GAIN_PCT -> NAO ENTRAR
-    if ganho_pct >= MIN_GAIN_PCT:
-        sinal_final = direction
-    else:
+    # ADX
+    adx_ind = ta.trend.ADXIndicator(
+        high=high, low=low, close=close, window=ADX_LEN
+    )
+    df["adx"] = adx_ind.adx()
+
+    ctx_row = df.iloc[-1]
+    price = float(ctx_row["close"])
+    atr = float(ctx_row["atr"])
+    ema_fast = float(ctx_row["ema_fast"])
+    ema_slow = float(ctx_row["ema_slow"])
+    adx = float(ctx_row["adx"])
+
+    # swing high/low dos últimos FIB_LOOKBACK candles
+    window = df.tail(FIB_LOOKBACK)
+    swing_high = float(window["high"].max())
+    swing_low = float(window["low"].min())
+
+    if price <= 0 or np.isnan(price):
+        return None
+
+    # Sanitiza ATR e swing range
+    if atr <= 0 or np.isnan(atr):
+        atr = abs(swing_high - swing_low) / 20.0 if swing_high > swing_low else price * 0.01
+
+    return IndicatorContext(
+        price=price,
+        atr=atr,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow,
+        adx=adx,
+        swing_high=swing_high,
+        swing_low=swing_low,
+    )
+
+
+# ====== DIREÇÃO (LONG / SHORT) ======
+
+
+def infer_direction(ctx: IndicatorContext) -> str:
+    """
+    Direção baseada na relação EMA rápida vs EMA lenta.
+    """
+    if ctx.ema_fast > ctx.ema_slow * 1.001:
+        return "LONG"
+    if ctx.ema_fast < ctx.ema_slow * 0.999:
+        return "SHORT"
+    return "NAO ENTRAR"
+
+
+# ====== FIBONACCI + ATR: CÁLCULO DOS ALVOS ======
+
+
+def compute_fibo_targets(direction: str, ctx: IndicatorContext) -> Targets:
+    """
+    Alvos usando extensão de Fibonacci sobre o range swing_high/low
+    combinada com ATR para evitar alvos irreais.
+
+    - Para LONG: preço + delta_x
+    - Para SHORT: preço - delta_x
+    """
+    price = ctx.price
+    swing_range = max(ctx.swing_high - ctx.swing_low, 0.0000001)
+    atr = max(ctx.atr, price * 0.005)  # pelo menos 0.5% do preço
+
+    # Razões de Fibonacci "clássicas" (23.6 / 38.2 / 61.8),
+    # usadas como múltiplos do swing_range. Sempre garantindo >= 1 ATR.
+    fib_ratios = [0.236, 0.382, 0.618]
+    deltas: List[float] = []
+
+    for r in fib_ratios:
+        base_delta = swing_range * r
+        delta = max(base_delta, atr)
+        deltas.append(delta)
+
+    targets: List[float] = []
+    gains_pct: List[float] = []
+
+    for delta in deltas:
+        if direction == "LONG":
+            t = price + delta
+            g = (t - price) / price * 100.0
+        elif direction == "SHORT":
+            t = max(price - delta, 0.0000001)
+            g = (price - t) / price * 100.0
+        else:
+            # direção neutra: devolve o próprio preço e ganho 0
+            t = price
+            g = 0.0
+
+        targets.append(t)
+        gains_pct.append(g)
+
+    return Targets(
+        alvo_1=targets[0],
+        alvo_2=targets[1],
+        alvo_3=targets[2],
+        ganho_1_pct=gains_pct[0],
+        ganho_2_pct=gains_pct[1],
+        ganho_3_pct=gains_pct[2],
+    )
+
+
+# ====== ASSERTIVIDADE (0–100%) ======
+
+
+def compute_assertiveness(direction: str, ctx: IndicatorContext) -> float:
+    """
+    Score empírico 0–100 com base em:
+    - ADX (força da tendência)
+    - distância entre EMAs
+    - direção definida (LONG/SHORT vs neutro)
+    """
+    if direction == "NAO ENTRAR":
+        return 0.0
+
+    # Força ADX normalizada
+    adx = max(ctx.adx, 0.0)
+    adx_norm = (adx - ADX_MIN) / (ADX_MAX - ADX_MIN)
+    adx_norm = float(np.clip(adx_norm, 0.0, 1.0))
+
+    # Distância relativa entre EMAs
+    ema_diff_pct = abs(ctx.ema_fast - ctx.ema_slow) / ctx.price * 100.0
+    ema_norm = ema_diff_pct / EMA_DIFF_MAX
+    ema_norm = float(np.clip(ema_norm, 0.0, 1.0))
+
+    # Combinação ponderada
+    score_0_1 = 0.6 * adx_norm + 0.4 * ema_norm
+
+    # Mapeia para uma faixa 40–95%
+    assert_pct = 40.0 + score_0_1 * 55.0
+    return float(np.clip(assert_pct, 0.0, 100.0))
+
+
+# ====== SINAL POR MOEDA/MODO ======
+
+
+def build_signal_for_coin(
+    coin: str,
+    mode: str,
+    exchanges: Dict[str, ccxt.Exchange],
+) -> Dict[str, object]:
+    """
+    Calcula o sinal completo para uma moeda em um modo (SWING ou POSICIONAL).
+    """
+    symbol = f"{coin}/{BASE}"
+    timeframe = SWING_TIMEFRAME if mode == "SWING" else POSICIONAL_TIMEFRAME
+
+    now = datetime.now(TZINFO)
+    data_str = now.strftime("%Y-%m-%d")
+    hora_str = now.strftime("%H:%M")
+
+    ohlcv = fetch_ohlcv_with_backup(exchanges, symbol, timeframe, CANDLE_LIMIT)
+    if ohlcv is None:
+        # Falha → devolve linha neutra
+        return {
+            "par": coin,
+            "sinal": "NAO ENTRAR",
+            "preco": 0.0,
+            "alvo": 0.0,
+            "ganho_pct": 0.0,
+            "assert_pct": 0.0,
+            "data": data_str,
+            "hora": hora_str,
+            "alvo_1": 0.0,
+            "ganho_1_pct": 0.0,
+            "alvo_2": 0.0,
+            "ganho_2_pct": 0.0,
+            "alvo_3": 0.0,
+            "ganho_3_pct": 0.0,
+            "sinal_base": "NAO ENTRAR",
+        }
+
+    ctx = build_indicator_context(ohlcv)
+    if ctx is None:
+        return {
+            "par": coin,
+            "sinal": "NAO ENTRAR",
+            "preco": 0.0,
+            "alvo": 0.0,
+            "ganho_pct": 0.0,
+            "assert_pct": 0.0,
+            "data": data_str,
+            "hora": hora_str,
+            "alvo_1": 0.0,
+            "ganho_1_pct": 0.0,
+            "alvo_2": 0.0,
+            "ganho_2_pct": 0.0,
+            "alvo_3": 0.0,
+            "ganho_3_pct": 0.0,
+            "sinal_base": "NAO ENTRAR",
+        }
+
+    direction = infer_direction(ctx)
+    targets = compute_fibo_targets(direction, ctx)
+    assert_pct = compute_assertiveness(direction, ctx)
+
+    # Aplica filtro: se GANHO_1 < 3%, sinal vira NAO ENTRAR,
+    # mas mantemos todos os cálculos na linha.
+    sinal_final = direction
+    if targets.ganho_1_pct < MIN_GAIN_PCT:
         sinal_final = "NAO ENTRAR"
 
-    return SinalEntrada(
-        par=coin,
-        sinal=sinal_final,
-        preco=preco_fmt,
-        alvo=alvo,
-        ganho_pct=ganho_pct,
-        assert_pct=round(assert_pct, PCT_DECIMALS),
-        data=data_str,
-        hora=hora_str,
-    )
+    preco_fmt = round(ctx.price, PRICE_DECIMALS)
+    alvo1_fmt = round(targets.alvo_1, PRICE_DECIMALS)
+    alvo2_fmt = round(targets.alvo_2, PRICE_DECIMALS)
+    alvo3_fmt = round(targets.alvo_3, PRICE_DECIMALS)
 
+    ganho1_fmt = round(targets.ganho_1_pct, PCT_DECIMALS)
+    ganho2_fmt = round(targets.ganho_2_pct, PCT_DECIMALS)
+    ganho3_fmt = round(targets.ganho_3_pct, PCT_DECIMALS)
 
-def _gerar_sinais_por_modo(modo: str) -> List[SinalEntrada]:
-    sinais: List[SinalEntrada] = []
+    assert_fmt = round(assert_pct, PCT_DECIMALS)
 
-    for coin in COINS:
-        try:
-            sinal = _gerar_sinal_para_moeda(coin, modo)
-            sinais.append(sinal)
-        except Exception as e:
-            _log(f"ERRO geral na moeda {coin} modo={modo}: {e}")
-            ts = _now_brt()
-            sinais.append(
-                SinalEntrada(
-                    par=coin,
-                    sinal="NAO ENTRAR",
-                    preco=0.0,
-                    alvo=0.0,
-                    ganho_pct=0.0,
-                    assert_pct=0.0,
-                    data=ts.strftime("%Y-%m-%d"),
-                    hora=ts.strftime("%H:%M"),
-                )
-            )
-
-        time.sleep(0.2)
-
-    sinais.sort(key=lambda s: s.par)
-    _log(f"Sinais gerados para modo={modo}: {len(sinais)} moedas.")
-    return sinais
-
-
-# ======================================================================
-# PIPELINE COMPLETO
-# ======================================================================
-
-
-def gerar_sinais() -> Dict[str, object]:
-    _log("Iniciando geração de sinais (tendência + ATR + variação 24h + assertividade)...")
-
-    swing = _gerar_sinais_por_modo("swing")
-    posicional = _gerar_sinais_por_modo("posicional")
-
-    payload = {
-        "generated_at": _now_brt().isoformat(),
-        "swing": [asdict(s) for s in swing],
-        "posicional": [asdict(s) for s in posicional],
+    # IMPORTANTE:
+    # - campo "alvo" e "ganho_pct" continuam sendo o ALVO 1 (para o painel ENTRADA)
+    # - campos extras serão usados depois no PAINEL SAÍDA.
+    return {
+        "par": coin,
+        "sinal": sinal_final,
+        "preco": preco_fmt,
+        "alvo": alvo1_fmt,
+        "ganho_pct": ganho1_fmt,
+        "assert_pct": assert_fmt,
+        "data": data_str,
+        "hora": hora_str,
+        "alvo_1": alvo1_fmt,
+        "ganho_1_pct": ganho1_fmt,
+        "alvo_2": alvo2_fmt,
+        "ganho_2_pct": ganho2_fmt,
+        "alvo_3": alvo3_fmt,
+        "ganho_3_pct": ganho3_fmt,
+        "sinal_base": direction,
     }
 
-    _log(
-        f"Sinais gerados: {len(payload['swing'])} swing, "
-        f"{len(payload['posicional'])} posicional."
-    )
-    return payload
+
+# ====== LOOP PRINCIPAL (TODAS AS MOEDAS) ======
 
 
-def salvar_json(payload: Dict[str, object]) -> None:
-    tmp_path = f"{ENTRADA_JSON_PATH}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
+def gerar_sinais_reais() -> Dict[str, object]:
+    exchanges = create_exchanges()
+
+    swing_rows: List[Dict[str, object]] = []
+    pos_rows: List[Dict[str, object]] = []
+
+    # Mantém a ordem alfabética fixa
+    for coin in COINS:
+        _log(f"Gerando sinais para {coin} – SWING...")
+        swing_rows.append(build_signal_for_coin(coin, "SWING", exchanges))
+
+    for coin in COINS:
+        _log(f"Gerando sinais para {coin} – POSICIONAL...")
+        pos_rows.append(build_signal_for_coin(coin, "POSICIONAL", exchanges))
+
+    generated_at = datetime.now(TZINFO).isoformat()
+
+    return {
+        "generated_at": generated_at,
+        "swing": swing_rows,
+        "posicional": pos_rows,
+    }
+
+
+def salvar_json(payload: Dict[str, object], path: str = "entrada.json") -> None:
+    _log(f"Salvando arquivo JSON em {path}...")
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, ENTRADA_JSON_PATH)
-    _log(f"Arquivo atualizado: {ENTRADA_JSON_PATH}")
 
 
 def main() -> None:
-    _log("Executando worker_entrada (modelo profissional de entrada)...")
-    payload = gerar_sinais()
+    _log("Executando worker_entrada REAL (FIBO + TENDÊNCIA + ATR)...")
+    payload = gerar_sinais_reais()
     salvar_json(payload)
-    _log("worker_entrada finalizado com sucesso.")
+    _log("worker_entrada REAL finalizado com sucesso.")
 
 
 if __name__ == "__main__":
