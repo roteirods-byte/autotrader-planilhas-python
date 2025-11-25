@@ -16,11 +16,11 @@ Modelo:
     dentro de um horizonte de candles.
 - Sempre preenche PREÇO, ALVO, GANHO%, ASSERT% para todas as moedas
   que tiverem dados.
-- SINAL é LONG/SHORT somente quando:
-    ganho_pct >= MIN_GAIN_PCT e assert_pct >= MIN_ASSERT_PCT.
-  Caso contrário, SINAL = "NAO ENTRAR".
-
-Saída: entrada.json no formato esperado pelo painel.
+- REGRA DO SINAL (a pedido do JORGE):
+    * Se GANHO% >= 3.0 -> SINAL = LONG ou SHORT.
+    * Se GANHO% < 3.0 -> SINAL = "NAO ENTRAR".
+  A ASSERTIVIDADE NÃO bloqueia mais a entrada; ela é só informativa
+  (para o painel colorir acima/abaixo de 65%).
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ CANDLES_POSICIONAL = 260   # timeframe 1d
 
 # Parâmetros do setup
 MIN_GAIN_PCT = 3.0       # lucro mínimo desejado
-MIN_ASSERT_PCT = 65.0    # assertividade mínima
+MIN_ASSERT_PCT = 65.0    # usado só para cor no painel, NÃO bloqueia entrada
 ATR_MULT_SWING = 2.0     # multiplicador de ATR para alvo swing
 ATR_MULT_POSIC = 2.5     # multiplicador de ATR para alvo posicional
 
@@ -195,6 +195,14 @@ def _calc_assertividade(
     """
     Probabilidade histórica do preço andar >= min_gain_pct na direção do setup
     nos próximos `horizon_bars` candles, condicionado à tendência por EMAs.
+
+    Conceito:
+    - Olha todos os pontos do passado em que:
+        LONG  -> close > ema_fast > ema_slow
+        SHORT -> close < ema_fast < ema_slow
+    - Para cada ponto, mede se nos próximos `horizon_bars` candles o preço
+      andou pelo menos `min_gain_pct` na direção.
+    - ASSERT% = sucessos / tentativas * 100.
     """
     closes = df["close"].values
     ema_fast = df["ema_fast"].values
@@ -249,7 +257,7 @@ def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
     """
     Gera o sinal para uma moeda e um modo ("swing" 4h ou "posicional" 1d).
     Sempre retorna PREÇO, ALVO, GANHO%, ASSERT% quando houver dados.
-    SINAL só é LONG/SHORT quando passar nos filtros.
+    SINAL só é LONG/SHORT quando GANHO% >= MIN_GAIN_PCT.
     """
 
     if modo == "swing":
@@ -315,7 +323,7 @@ def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
             hora=hora_str,
         )
 
-    # variação 24h (reforço de direção)
+    # variação 24h (reforço de direção, mas simples)
     change_24h = _get_daily_change_24h(coin)
 
     # Direção principal pelos EMAs; se neutro, usa sinal da variação 24h
@@ -339,6 +347,8 @@ def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
     alvo_pct = max(MIN_GAIN_PCT, atr_mult * atr_pct)
     ganho_pct = round(alvo_pct, PCT_DECIMALS)
 
+    # PREÇO ALVO:
+    # - baseado em ATR: alvo = preço ± (alvo_pct%)
     if direction == "LONG":
         alvo = price * (1.0 + alvo_pct / 100.0)
     else:
@@ -347,10 +357,10 @@ def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
     alvo = round(alvo, PRICE_DECIMALS)
     preco_fmt = round(price, PRICE_DECIMALS)
 
-    # Regra FINAL de operação:
-    # se (ganho >= 3% e assert >= 65%) -> sinal LONG/SHORT
-    # caso contrário -> NAO ENTRAR, mas mantendo os cálculos
-    if ganho_pct >= MIN_GAIN_PCT and assert_pct >= MIN_ASSERT_PCT:
+    # REGRA FINAL DO SINAL (a pedido do JORGE):
+    # Se GANHO% >= 3.0 -> LONG/SHORT
+    # Se GANHO% < 3.0 -> NAO ENTRAR
+    if ganho_pct >= MIN_GAIN_PCT:
         sinal_final = direction
     else:
         sinal_final = "NAO ENTRAR"
