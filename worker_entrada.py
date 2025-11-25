@@ -10,17 +10,21 @@ Modelo:
 - Calcula EMAs (20/50) para tendência.
 - Calcula ATR(14) para volatilidade.
 - Usa variação de 24h (1d) como reforço de direção.
-- Calcula alvo em múltiplos de ATR.
+- Calcula alvo em múltiplos de ATR (apenas volatilidade, sem mínimo artificial).
 - Calcula assertividade simples via backtest:
   * quantas vezes o preço andou >= MIN_GAIN_PCT na direção do setup,
     dentro de um horizonte de candles.
 - Sempre preenche PREÇO, ALVO, GANHO%, ASSERT% para todas as moedas
   que tiverem dados.
-- REGRA DO SINAL (a pedido do JORGE):
-    * Se GANHO% >= 3.0 -> SINAL = LONG ou SHORT.
-    * Se GANHO% < 3.0 -> SINAL = "NAO ENTRAR".
-  A ASSERTIVIDADE NÃO bloqueia mais a entrada; ela é só informativa
-  (para o painel colorir acima/abaixo de 65%).
+
+REGRAS PEDIDAS PELO JORGE:
+
+- SINAL:
+    * Se GANHO% >= MIN_GAIN_PCT (3.0 por padrão) -> SINAL = LONG ou SHORT.
+    * Se GANHO% < MIN_GAIN_PCT -> SINAL = "NAO ENTRAR".
+- ASSERTIVIDADE:
+    * NÃO bloqueia mais a operação, é só informativa (para o painel colorir
+      acima/abaixo de 65%).
 """
 
 from __future__ import annotations
@@ -94,7 +98,7 @@ CANDLES_SWING = 200        # timeframe 4h
 CANDLES_POSICIONAL = 260   # timeframe 1d
 
 # Parâmetros do setup
-MIN_GAIN_PCT = 3.0       # lucro mínimo desejado
+MIN_GAIN_PCT = 3.0       # lucro mínimo desejado (filtro de entrada)
 MIN_ASSERT_PCT = 65.0    # usado só para cor no painel, NÃO bloqueia entrada
 ATR_MULT_SWING = 2.0     # multiplicador de ATR para alvo swing
 ATR_MULT_POSIC = 2.5     # multiplicador de ATR para alvo posicional
@@ -323,7 +327,7 @@ def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
             hora=hora_str,
         )
 
-    # variação 24h (reforço de direção, mas simples)
+    # variação 24h (reforço simples de direção)
     change_24h = _get_daily_change_24h(coin)
 
     # Direção principal pelos EMAs; se neutro, usa sinal da variação 24h
@@ -342,13 +346,16 @@ def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
         horizon_bars=horizon,
     )
 
-    # Ganho alvo em %: múltiplo de ATR, mas nunca abaixo do mínimo
+    # ==========================================================
+    # CÁLCULO DO ALVO (CORRIGIDO):
+    # - ATR_MULT * ATR -> alvo "natural" pela volatilidade.
+    # - NÃO usa mais max(..., MIN_GAIN_PCT).
+    #   O mínimo de ganho é filtro, não entra na fórmula do alvo.
+    # ==========================================================
     atr_pct = (atr / price) * 100.0
-    alvo_pct = max(MIN_GAIN_PCT, atr_mult * atr_pct)
+    alvo_pct = atr_mult * atr_pct
     ganho_pct = round(alvo_pct, PCT_DECIMALS)
 
-    # PREÇO ALVO:
-    # - baseado em ATR: alvo = preço ± (alvo_pct%)
     if direction == "LONG":
         alvo = price * (1.0 + alvo_pct / 100.0)
     else:
@@ -357,9 +364,9 @@ def _gerar_sinal_para_moeda(coin: str, modo: str) -> SinalEntrada:
     alvo = round(alvo, PRICE_DECIMALS)
     preco_fmt = round(price, PRICE_DECIMALS)
 
-    # REGRA FINAL DO SINAL (a pedido do JORGE):
-    # Se GANHO% >= 3.0 -> LONG/SHORT
-    # Se GANHO% < 3.0 -> NAO ENTRAR
+    # REGRA FINAL DO SINAL:
+    # Se GANHO% >= MIN_GAIN_PCT -> LONG/SHORT
+    # Se GANHO% < MIN_GAIN_PCT -> NAO ENTRAR
     if ganho_pct >= MIN_GAIN_PCT:
         sinal_final = direction
     else:
