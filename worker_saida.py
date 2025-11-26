@@ -77,17 +77,12 @@ def salvar_json(caminho: str, dados: List[Dict[str, Any]]) -> None:
 def buscar_preco_atual(par: str) -> Optional[float]:
     """
     Busca o preço atual da moeda na corretora.
-
-    IMPORTANTE: ajuste esta função de acordo com o que já existe
-    no seu arquivo exchanges.py.
-
-    Abaixo está uma tentativa genérica usando um par 'TICKER/USDT'.
-    Se o seu exchanges.py tiver outro nome de função, adapte aqui.
+    Recebe só o ticker (AAVE, ADA, BTC, etc.).
+    O exchanges.py já cuida do /USDT.
     """
-    simbolo = f"{par}/USDT"
+    simbolo = par
 
     try:
-        # Tenta algumas assinaturas comuns.
         if hasattr(exchanges, "get_price"):
             preco = exchanges.get_price(simbolo, exchange_name=EXCHANGE_PREFERENCIAL)
         elif hasattr(exchanges, "get_last_price"):
