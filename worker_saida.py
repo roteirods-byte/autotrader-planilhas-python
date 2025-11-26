@@ -76,12 +76,12 @@ def salvar_json(caminho: str, dados: List[Dict[str, Any]]) -> None:
 
 def buscar_preco_atual(par: str) -> Optional[float]:
     """
-    Busca o preço atual usando OHLCV.
+    Busca o preço atual usando OHLCV 4h.
     Aceita 'AAVE' ou 'AAVE/USDT', mas sempre usa só o ticker.
     """
-    # Garante que vamos usar apenas o ticker (sem /USDT)
+    # Usa só o ticker (sem /USDT)
     base = par.split("/")[0].strip().upper()
-    timeframe = "1h"
+    timeframe = "4h"  # mesmo timeframe do swing
 
     try:
         if hasattr(exchanges, "get_ohlcv"):
@@ -98,6 +98,7 @@ def buscar_preco_atual(par: str) -> Optional[float]:
             return None
 
         candle = candles[-1]
+        # candle = [ts, open, high, low, close] ou [ts, open, high, low, close, volume]
         if len(candle) < 5:
             logging.error(f"[worker_saida] Candle inválido para {base}: {candle}")
             return None
