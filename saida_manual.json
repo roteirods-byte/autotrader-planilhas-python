@@ -1,0 +1,12 @@
+[
+  {
+    "par": "AAVE",
+    "side": "LONG",
+    "modo": "SWING",
+    "entrada": 175.0,
+    "alvo_1": 183.0,
+    "alvo_2": 190.0,
+    "alvo_3": 200.0,
+    "alav": 5
+  }
+]
