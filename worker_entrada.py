@@ -22,6 +22,7 @@
 import json
 import os
 import logging
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
@@ -237,15 +238,21 @@ def calcular_assertividade_estimada(
 def obter_ohlcv(par: str, timeframe: str, limit: int) -> List[List[float]]:
     """
     Recebe apenas o ticker (AAVE, ADA, BTC, etc.).
-    O exchanges.py já acrescenta /USDT internamente.
+    O exchanges.py já cuida do símbolo completo.
+    Sempre devolve lista de candles [timestamp, open, high, low, close, volume].
     """
     try:
         if hasattr(exchanges, "get_ohlcv"):
-            return exchanges.get_ohlcv(par, timeframe=timeframe, limit=limit)
+            dados = exchanges.get_ohlcv(par, timeframe=timeframe, limit=limit)
         elif hasattr(exchanges, "get_ohlcv_binance"):
-            return exchanges.get_ohlcv_binance(par, timeframe=timeframe, limit=limit)
+            dados = exchanges.get_ohlcv_binance(par, timeframe=timeframe, limit=limit)
         else:
             raise RuntimeError("Ajuste obter_ohlcv() para o seu exchanges.py")
+
+        # Se vier em formato DataFrame, converte para lista de listas
+        if isinstance(dados, pd.DataFrame):
+            return dados.to_numpy().tolist()
+        return dados
     except Exception as e:
         logging.error(f"[worker_entrada] Erro ao obter OHLCV de {par}: {e}")
         return []
