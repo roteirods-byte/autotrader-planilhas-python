@@ -98,18 +98,33 @@ def ema(valores: List[float], periodo: int) -> float:
 
 
 def calcular_atr(ohlcv: List[List[float]], periodo: int = 14) -> float:
+    """
+    Calcula ATR usando apenas high, low e close.
+    Aceita candles com 5 ou 6 valores:
+      [ts, open, high, low, close] ou [ts, open, high, low, close, volume]
+    """
+
     if len(ohlcv) < periodo + 1:
         return 0.0
 
+    def extrair_hlc(candle: List[float]) -> Tuple[float, float, float]:
+        # Garante pelo menos 5 valores
+        if len(candle) < 5:
+            raise ValueError("Candle com menos de 5 valores")
+        # Pegamos só os 5 primeiros: ts, open, high, low, close
+        _, _open, high, low, close = candle[:5]
+        return float(high), float(low), float(close)
+
     trs: List[float] = []
+
     for i in range(1, len(ohlcv)):
-        _, _, high, low, close_anterior, _ = ohlcv[i - 1]
-        _, _, high_atual, low_atual, close_atual, _ = ohlcv[i]
+        high_prev, low_prev, close_prev = extrair_hlc(ohlcv[i - 1])
+        high_atual, low_atual, close_atual = extrair_hlc(ohlcv[i])
 
         tr = max(
             high_atual - low_atual,
-            abs(high_atual - close_anterior),
-            abs(low_atual - close_anterior),
+            abs(high_atual - close_prev),
+            abs(low_atual - close_prev),
         )
         trs.append(tr)
 
@@ -118,7 +133,6 @@ def calcular_atr(ohlcv: List[List[float]], periodo: int = 14) -> float:
 
     ultimos = trs[-periodo:]
     return sum(ultimos) / periodo
-
 
 def variacao_percentual_24h(closes: List[float], janela_24h: int) -> float:
     if len(closes) <= janela_24h:
