@@ -76,25 +76,37 @@ def salvar_json(caminho: str, dados: List[Dict[str, Any]]) -> None:
 
 def buscar_preco_atual(par: str) -> Optional[float]:
     """
-    Busca o preço atual da moeda na corretora.
-    Recebe só o ticker (AAVE, ADA, BTC, etc.).
-    O exchanges.py já cuida do /USDT.
+    Busca o preço atual usando OHLCV.
+    Recebe só o ticker (AAVE, ADA, BTC etc).
+    Usa o último close de um timeframe curto.
     """
-    simbolo = par
+    timeframe = "1h"   # pode ajustar depois se quiser
 
     try:
-        if hasattr(exchanges, "get_price"):
-            preco = exchanges.get_price(simbolo, exchange_name=EXCHANGE_PREFERENCIAL)
-        elif hasattr(exchanges, "get_last_price"):
-            preco = exchanges.get_last_price(simbolo, exchange_name=EXCHANGE_PREFERENCIAL)
+        if hasattr(exchanges, "get_ohlcv"):
+            candles = exchanges.get_ohlcv(par, timeframe=timeframe, limit=1)
+        elif hasattr(exchanges, "get_ohlcv_binance"):
+            candles = exchanges.get_ohlcv_binance(par, timeframe=timeframe, limit=1)
         else:
             raise RuntimeError(
                 "Ajuste buscar_preco_atual() para usar a função correta de exchanges.py"
             )
 
-        return float(preco)
+        if candles is None or len(candles) == 0:
+            logging.error(f"[worker_saida] Nenhum candle retornado para {par}")
+            return None
+
+        candle = candles[-1]
+        # candle = [ts, open, high, low, close] ou [ts, open, high, low, close, volume]
+        if len(candle) < 5:
+            logging.error(f"[worker_saida] Candle inválido para {par}: {candle}")
+            return None
+
+        close = float(candle[4])
+        return close
+
     except Exception as e:
-        logging.error(f"[worker_saida] Erro ao obter preço de {simbolo}: {e}")
+        logging.error(f"[worker_saida] Erro ao obter preço de {par}: {e}")
         return None
 
 
