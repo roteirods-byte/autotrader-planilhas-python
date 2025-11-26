@@ -235,16 +235,19 @@ def calcular_assertividade_estimada(
 # ------------------------------------------------
 
 def obter_ohlcv(par: str, timeframe: str, limit: int) -> List[List[float]]:
-    simbolo = f"{par}/USDT"
+    """
+    Recebe apenas o ticker (AAVE, ADA, BTC, etc.).
+    O exchanges.py já acrescenta /USDT internamente.
+    """
     try:
         if hasattr(exchanges, "get_ohlcv"):
-            return exchanges.get_ohlcv(simbolo, timeframe=timeframe, limit=limit)
+            return exchanges.get_ohlcv(par, timeframe=timeframe, limit=limit)
         elif hasattr(exchanges, "get_ohlcv_binance"):
-            return exchanges.get_ohlcv_binance(simbolo, timeframe=timeframe, limit=limit)
+            return exchanges.get_ohlcv_binance(par, timeframe=timeframe, limit=limit)
         else:
             raise RuntimeError("Ajuste obter_ohlcv() para o seu exchanges.py")
     except Exception as e:
-        logging.error(f"[worker_entrada] Erro ao obter OHLCV de {simbolo}: {e}")
+        logging.error(f"[worker_entrada] Erro ao obter OHLCV de {par}: {e}")
         return []
 
 
