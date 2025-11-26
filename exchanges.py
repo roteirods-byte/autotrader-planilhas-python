@@ -60,11 +60,19 @@ _EXCHANGES: Dict[str, ccxt.Exchange] = _create_exchanges()
 
 def _coin_to_symbol(coin: str) -> str:
     """
-    Converte 'BTC' -> 'BTC/USDT'.
-    Todas as 3 corretoras usam par com USDT.
-    """
-    return f"{coin}/USDT"
+    Converte o ticker em symbol da corretora.
 
+    - Se já vier "AAVE/USDT", devolve igual.
+    - Se vier só "AAVE", monta "AAVE/USDT".
+    """
+    c = coin.strip().upper()
+
+    # Já é par completo? Não mexe.
+    if "/" in c:
+        return c
+
+    # Só ticker? Acrescenta /USDT
+    return f"{c}/USDT"
 
 def get_ohlcv(
     coin: str,
