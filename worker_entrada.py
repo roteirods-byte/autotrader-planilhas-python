@@ -258,7 +258,7 @@ def gerar_sinal_para_par_modo(par: str, modo: str) -> Dict[str, Any]:
     janela_24h = cfg["janela_24h"]
 
     ohlcv = obter_ohlcv(par, timeframe, janela_ohlcv)
-    if not ohlcv:
+    if ohlcv is None or len(ohlcv) == 0:
         return {}
 
     highs = [c[2] for c in ohlcv]
