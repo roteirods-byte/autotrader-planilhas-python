@@ -11,6 +11,7 @@
 import json
 import os
 import logging
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -77,28 +78,40 @@ def salvar_json(caminho: str, dados: List[Dict[str, Any]]) -> None:
 def buscar_preco_atual(par: str) -> Optional[float]:
     """
     Busca o preço atual usando OHLCV 4h.
-    Aceita 'AAVE' ou 'AAVE/USDT', mas sempre usa só o ticker.
+    Usa o mesmo esquema do worker de entrada:
+    pega vários candles e usa o último close.
     """
-    # Usa só o ticker (sem /USDT)
     base = par.split("/")[0].strip().upper()
-    timeframe = "4h"  # mesmo timeframe do swing
+    timeframe = "4h"
 
     try:
         if hasattr(exchanges, "get_ohlcv"):
-            candles = exchanges.get_ohlcv(base, timeframe=timeframe, limit=1)
+            dados = exchanges.get_ohlcv(base, timeframe=timeframe, limit=120)
         elif hasattr(exchanges, "get_ohlcv_binance"):
-            candles = exchanges.get_ohlcv_binance(base, timeframe=timeframe, limit=1)
+            dados = exchanges.get_ohlcv_binance(base, timeframe=timeframe, limit=120)
         else:
             raise RuntimeError(
                 "Ajuste buscar_preco_atual() para usar a função correta de exchanges.py"
             )
 
-        if candles is None or len(candles) == 0:
-            logging.error(f"[worker_saida] Nenhum candle retornado para {base}")
+        if dados is None:
+            logging.error(f"[worker_saida] Nenhum dado OHLCV retornado para {base}")
             return None
 
-        candle = candles[-1]
-        # candle = [ts, open, high, low, close] ou [ts, open, high, low, close, volume]
+        # Caso 1: DataFrame (retorno padrão do exchanges.get_ohlcv)
+        if isinstance(dados, pd.DataFrame):
+            if dados.empty:
+                logging.error(f"[worker_saida] DataFrame vazio para {base}")
+                return None
+            close = float(dados["close"].iloc[-1])
+            return close
+
+        # Caso 2: lista de candles [ts, open, high, low, close, ...]
+        if len(dados) == 0:
+            logging.error(f"[worker_saida] Lista OHLCV vazia para {base}")
+            return None
+
+        candle = dados[-1]
         if len(candle) < 5:
             logging.error(f"[worker_saida] Candle inválido para {base}: {candle}")
             return None
@@ -109,7 +122,6 @@ def buscar_preco_atual(par: str) -> Optional[float]:
     except Exception as e:
         logging.error(f"[worker_saida] Erro ao obter preço de {base}: {e}")
         return None
-
 
 def calcular_pnl_pct(side: str, preco_entrada: float, preco_atual: float) -> float:
     """Calcula PNL% da operação com base na direção (LONG ou SHORT)."""
