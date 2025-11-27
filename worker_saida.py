@@ -1,21 +1,31 @@
 # ================================================================
-#   WORKER DE SAÍDA — AUTOTRADER
-#   Lê saida_manual.json, busca preço atual nas corretoras,
-#   calcula PNL% e situação (ABERTA / ALVO 1 / ALVO 2 / ALVO 3)
-#   e grava o resultado em saida_monitoramento.json.
+#   WORKER DE SAÍDA — AUTOTRADER (VERSÃO PROFISSIONAL, INDEPENDENTE)
 #
-#   Ajuste os caminhos dos arquivos ou use variáveis de ambiente:
-#   SAIDA_MANUAL_JSON_PATH e SAIDA_MONITORAMENTO_JSON_PATH
+#   - Lê saida_manual.json  (operações digitadas)
+#   - Busca OHLCV 4h nas corretoras (via exchanges.py)
+#   - Calcula ATR 14 períodos
+#   - Calcula alvos profissionais com FIBO + ATR:
+#       LONG : alvo1 = entrada + 0.618*ATR
+#              alvo2 = entrada + 1.000*ATR
+#              alvo3 = entrada + 1.618*ATR
+#       SHORT: simétrico para baixo
+#   - Calcula ganho_1/2/3_pct, pnl_pct e situação (ABERTA / ALVO 1/2/3)
+#   - Grava saida_monitoramento.json
+#
+#   Caminhos podem ser definidos por variáveis de ambiente:
+#       SAIDA_MANUAL_JSON_PATH
+#       SAIDA_MONITORAMENTO_JSON_PATH
 # ================================================================
 
 import json
 import os
 import logging
-import pandas as pd
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import exchanges  # usa o mesmo arquivo exchanges.py do worker_entrada
+import pandas as pd
+
+import exchanges  # mesmo exchanges.py do worker_entrada
 
 
 # ------------------------------------------------
@@ -32,23 +42,18 @@ SAIDA_MONITORAMENTO_JSON_PATH = os.environ.get(
     "saida_monitoramento.json",
 )
 
-# Caso você queira forçar uma corretora principal para os preços:
-EXCHANGE_PREFERENCIAL = os.environ.get("SAIDA_EXCHANGE", "binance")
-
 
 # ------------------------------------------------
 # Funções auxiliares
 # ------------------------------------------------
 
-def agora_brt():
-    """Retorna data e hora no fuso de Brasília (sem horário de verão)."""
-    agora_utc = datetime.utcnow()
-    brt = agora_utc - timedelta(hours=3)
-    return brt
+def agora_brt() -> datetime:
+    """Retorna data/hora no fuso de Brasília (UTC-3)."""
+    return datetime.utcnow() - timedelta(hours=3)
 
 
 def carregar_json(caminho: str) -> List[Dict[str, Any]]:
-    """Carrega um arquivo JSON de lista. Se não existir, retorna lista vazia."""
+    """Carrega lista JSON; se não existir ou erro, retorna lista vazia."""
     if not os.path.exists(caminho):
         logging.warning(f"[worker_saida] Arquivo não encontrado: {caminho}")
         return []
@@ -66,7 +71,7 @@ def carregar_json(caminho: str) -> List[Dict[str, Any]]:
 
 
 def salvar_json(caminho: str, dados: List[Dict[str, Any]]) -> None:
-    """Salva a lista em JSON com identação."""
+    """Salva lista em JSON com indentação."""
     try:
         with open(caminho, "w", encoding="utf-8") as f:
             json.dump(dados, f, ensure_ascii=False, indent=2)
@@ -75,56 +80,114 @@ def salvar_json(caminho: str, dados: List[Dict[str, Any]]) -> None:
         logging.error(f"[worker_saida] Erro ao gravar {caminho}: {e}")
 
 
-def buscar_preco_atual(par: str) -> Optional[float]:
+def obter_ohlcv_4h(base: str, limit: int = 200) -> Optional[pd.DataFrame]:
     """
-    Busca o preço atual usando OHLCV 4h.
-    Usa o mesmo esquema do worker de entrada:
-    pega vários candles e usa o último close.
+    Puxa OHLCV 4h da coin `base` usando exchanges.py.
+    Retorna DataFrame com colunas ['open','high','low','close'].
     """
-    base = par.split("/")[0].strip().upper()
     timeframe = "4h"
 
     try:
         if hasattr(exchanges, "get_ohlcv"):
-            dados = exchanges.get_ohlcv(base, timeframe=timeframe, limit=120)
+            dados = exchanges.get_ohlcv(base, timeframe=timeframe, limit=limit)
         elif hasattr(exchanges, "get_ohlcv_binance"):
-            dados = exchanges.get_ohlcv_binance(base, timeframe=timeframe, limit=120)
+            dados = exchanges.get_ohlcv_binance(base, timeframe=timeframe, limit=limit)
         else:
             raise RuntimeError(
-                "Ajuste buscar_preco_atual() para usar a função correta de exchanges.py"
+                "Ajuste obter_ohlcv_4h() para usar a função correta de exchanges.py"
             )
 
         if dados is None:
             logging.error(f"[worker_saida] Nenhum dado OHLCV retornado para {base}")
             return None
 
-        # Caso 1: DataFrame (retorno padrão do exchanges.get_ohlcv)
         if isinstance(dados, pd.DataFrame):
             if dados.empty:
-                logging.error(f"[worker_saida] DataFrame vazio para {base}")
+                logging.error(f"[worker_saida] DataFrame OHLCV vazio para {base}")
                 return None
-            close = float(dados["close"].iloc[-1])
-            return close
+            return dados
 
-        # Caso 2: lista de candles [ts, open, high, low, close, ...]
-        if len(dados) == 0:
+        # Se vier lista de candles, converte para DataFrame
+        if not isinstance(dados, list) or len(dados) == 0:
             logging.error(f"[worker_saida] Lista OHLCV vazia para {base}")
             return None
 
-        candle = dados[-1]
-        if len(candle) < 5:
-            logging.error(f"[worker_saida] Candle inválido para {base}: {candle}")
-            return None
-
-        close = float(candle[4])
-        return close
+        cols = ["timestamp", "open", "high", "low", "close", "volume"]
+        df = pd.DataFrame(dados, columns=cols[: len(dados[0])])
+        return df
 
     except Exception as e:
-        logging.error(f"[worker_saida] Erro ao obter preço de {base}: {e}")
+        logging.error(f"[worker_saida] Erro ao obter OHLCV de {base}: {e}")
         return None
 
+
+def calcular_atr(df: pd.DataFrame, periodos: int = 14) -> Optional[float]:
+    """Calcula ATR simples a partir de DataFrame OHLCV."""
+    try:
+        if not {"high", "low", "close"}.issubset(df.columns):
+            return None
+
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+
+        prev_close = close.shift(1)
+
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=periodos).mean().iloc[-1]
+
+        if pd.isna(atr):
+            return None
+        return float(atr)
+    except Exception as e:
+        logging.error(f"[worker_saida] Erro ao calcular ATR: {e}")
+        return None
+
+
+def calcular_alvos_profissionais(
+    side: str,
+    preco_entrada: float,
+    atr: Optional[float],
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Calcula ALVO 1, 2 e 3 usando ATR + Fibo.
+
+    - Se ATR não disponível: retorna (None, None, None).
+    - LONG :
+        alvo1 = entrada + 0.618 * ATR
+        alvo2 = entrada + 1.000 * ATR
+        alvo3 = entrada + 1.618 * ATR
+    - SHORT:
+        alvo1 = entrada - 0.618 * ATR
+        alvo2 = entrada - 1.000 * ATR
+        alvo3 = entrada - 1.618 * ATR
+    """
+    if atr is None or preco_entrada <= 0:
+        return None, None, None
+
+    side = (side or "").upper()
+    atr = float(atr)
+
+    if side == "LONG":
+        a1 = preco_entrada + 0.618 * atr
+        a2 = preco_entrada + 1.000 * atr
+        a3 = preco_entrada + 1.618 * atr
+    elif side == "SHORT":
+        a1 = preco_entrada - 0.618 * atr
+        a2 = preco_entrada - 1.000 * atr
+        a3 = preco_entrada - 1.618 * atr
+    else:
+        return None, None, None
+
+    return a1, a2, a3
+
+
 def calcular_pnl_pct(side: str, preco_entrada: float, preco_atual: float) -> float:
-    """Calcula PNL% da operação com base na direção (LONG ou SHORT)."""
+    """PNL% da operação com base na direção (LONG/SHORT)."""
     if preco_entrada is None or preco_entrada == 0 or preco_atual is None:
         return 0.0
 
@@ -140,7 +203,7 @@ def calcular_pnl_pct(side: str, preco_entrada: float, preco_atual: float) -> flo
 
 
 def calcular_ganho_pct(side: str, preco_entrada: float, alvo: Optional[float]) -> float:
-    """Calcula o ganho esperado (%) entre a entrada e um alvo."""
+    """Ganho esperado (%) entre entrada e alvo."""
     if alvo is None or preco_entrada is None or preco_entrada == 0:
         return 0.0
 
@@ -162,18 +225,7 @@ def classificar_situacao(
     alvo_2: Optional[float],
     alvo_3: Optional[float],
 ) -> str:
-    """
-    Define a SITUAÇÃO da operação com base no preço atual e nos alvos.
-
-    Regras simples:
-      - se não há alvo → "ABERTA"
-      - LONG:
-          preço >= alvo_3 → "ALVO 3"
-          senão preço >= alvo_2 → "ALVO 2"
-          senão preço >= alvo_1 → "ALVO 1"
-          senão → "ABERTA"
-      - SHORT (inverte as desigualdades)
-    """
+    """Define SITUAÇÃO com base no preço atual e nos alvos."""
     if preco_atual is None or alvo_1 is None:
         return "ABERTA"
 
@@ -204,13 +256,16 @@ def classificar_situacao(
 # Worker principal
 # ------------------------------------------------
 
-def processar_operacoes():
-    """Lê saida_manual.json, calcula preços/PNL e grava saida_monitoramento.json."""
+def processar_operacoes() -> None:
+    """
+    Lê saida_manual.json, calcula alvos profissionais, PNL e situação,
+    e grava saida_monitoramento.json.
+    """
     logging.info("[worker_saida] Iniciando processamento.")
 
     operacoes = carregar_json(SAIDA_MANUAL_JSON_PATH)
     if not operacoes:
-        logging.info("[worker_saida] Nenhuma operação encontrada em saida_manual.json.")
+        logging.info("[worker_saida] Nenhuma operação em saida_manual.json.")
         salvar_json(SAIDA_MONITORAMENTO_JSON_PATH, [])
         return
 
@@ -226,7 +281,8 @@ def processar_operacoes():
             if not par:
                 continue
 
-            # Aceita tanto "side" quanto "sinal" como nome de campo
+            base = par.split("/")[0].strip().upper()
+
             side = (op.get("side") or op.get("sinal") or op.get("SINAL") or "").upper()
             modo = (op.get("modo") or op.get("MODO") or "SWING").upper()
 
@@ -235,32 +291,26 @@ def processar_operacoes():
                 continue
             preco_entrada = float(preco_entrada)
 
-            # Alvos (podem não existir ainda; tudo opcional)
-            alvo_1 = op.get("alvo_1") or op.get("ALVO_1")
-            alvo_2 = op.get("alvo_2") or op.get("ALVO_2")
-            alvo_3 = op.get("alvo_3") or op.get("ALVO_3")
-
-            alvo_1 = float(alvo_1) if alvo_1 is not None else None
-            alvo_2 = float(alvo_2) if alvo_2 is not None else None
-            alvo_3 = float(alvo_3) if alvo_3 is not None else None
-
             alav = op.get("alav") or op.get("ALAV") or 1
             alav = int(alav)
 
-            # Busca preço atual
-            preco_atual = buscar_preco_atual(par)
-            if preco_atual is None:
+            # OHLCV 4h → ATR + preço atual (último close)
+            df = obter_ohlcv_4h(base, limit=200)
+            if df is None or df.empty:
+                logging.error(f"[worker_saida] Sem OHLCV para {base}, pulando operação.")
                 continue
 
-            # Calcula PNL% da operação
-            pnl_pct = calcular_pnl_pct(side, preco_entrada, preco_atual)
+            preco_atual = float(df["close"].iloc[-1])
 
-            # Calcula ganhos potenciais para cada alvo (se existirem)
+            atr = calcular_atr(df, periodos=14)
+            alvo_1, alvo_2, alvo_3 = calcular_alvos_profissionais(side, preco_entrada, atr)
+
+            # PNL atual e ganhos para cada alvo
+            pnl_pct = calcular_pnl_pct(side, preco_entrada, preco_atual)
             ganho_1_pct = calcular_ganho_pct(side, preco_entrada, alvo_1)
             ganho_2_pct = calcular_ganho_pct(side, preco_entrada, alvo_2)
             ganho_3_pct = calcular_ganho_pct(side, preco_entrada, alvo_3)
 
-            # Situação atual (ABERTA / ALVO 1 / ALVO 2 / ALVO 3)
             situacao = classificar_situacao(side, preco_atual, alvo_1, alvo_2, alvo_3)
 
             linha = {
