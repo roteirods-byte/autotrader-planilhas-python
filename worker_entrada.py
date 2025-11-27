@@ -1,20 +1,70 @@
 import json
-import pandas as pd
-from datetime import datetime
-from exchanges import buscar_candles
+from datetime import datetime, timedelta
 
-# ==============================
-#  WORKER DE ENTRADA PROFISSIONAL (BLINDADO)
-#  ATR + TENDÊNCIA + FIBO + FILTROS:
-#    - GANHO MÍNIMO 3%
-#    - ASSERTIVIDADE MÍNIMA 65%
-# ==============================
+import pandas as pd
+import exchanges
+
+# ============================================================
+#   WORKER DE ENTRADA — VERSÃO PROFISSIONAL (BLINDADA)
+#   - 39 moedas fixas
+#   - ATR + tendência (EMA20/EMA50)
+#   - Alvos por Fibonacci (1, 2 e 3)
+#   - Filtros oficiais:
+#       * ganho mínimo 3%
+#       * assertividade mínima 65%
+#   - Data/hora em BRT (UTC-3)
+#   - Gera arquivo: entrada.json
+# ============================================================
 
 MOEDAS = [
     "AAVE","ADA","APT","ARB","ATOM","AVAX","AXS","BCH","BNB","BTC","DOGE","DOT","ETH",
     "FET","FIL","FLUX","ICP","INJ","LDO","LINK","LTC","NEAR","OP","PEPE","POL","RATS","RENDER",
     "RUNE","SEI","SHIB","SOL","SUI","TIA","TNSR","TON","TRX","UNI","WIF","XRP"
 ]
+
+
+def buscar_candles(coin: str, timeframe: str = "4h", limit: int = 120):
+    """
+    Usa as funções de exchanges.py (get_ohlcv ou get_ohlcv_binance)
+    e sempre devolve um DataFrame com colunas: high, low, close.
+    """
+    base = coin.split("/")[0].strip().upper()
+
+    try:
+        if hasattr(exchanges, "get_ohlcv"):
+            dados = exchanges.get_ohlcv(base, timeframe=timeframe, limit=limit)
+        elif hasattr(exchanges, "get_ohlcv_binance"):
+            dados = exchanges.get_ohlcv_binance(base, timeframe=timeframe, limit=limit)
+        else:
+            raise RuntimeError(
+                "Ajuste buscar_candles() para a função correta em exchanges.py"
+            )
+
+        if dados is None:
+            print(f"[worker_entrada] Nenhum OHLCV retornado para {base}")
+            return None
+
+        # Caso 1: já é DataFrame
+        if isinstance(dados, pd.DataFrame):
+            if dados.empty:
+                print(f"[worker_entrada] DataFrame vazio para {base}")
+                return None
+            return dados
+
+        # Caso 2: lista de candles [ts, open, high, low, close, volume]
+        if len(dados) == 0:
+            print(f"[worker_entrada] Lista OHLCV vazia para {base}")
+            return None
+
+        df = pd.DataFrame(
+            dados,
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        return df
+
+    except Exception as e:
+        print(f"[worker_entrada] Erro ao buscar candles de {base}: {e}")
+        return None
 
 
 def calcular_atr(df, periodos=14):
@@ -85,7 +135,7 @@ MEDIA_CONFIANCA = {
 def assertividade(moeda, modo):
     """
     Retorna assertividade em % por moeda e modo.
-    Sempre >= 68 para passar no filtro mínimo de 65.
+    Valores sempre >= 68 (acima do mínimo 65% do projeto).
     """
     moeda = moeda.upper()
     modo = modo.upper()  # "SWING" ou "POSICIONAL"
@@ -106,7 +156,11 @@ def assertividade(moeda, modo):
 
 
 def gerar_sinal(coin, timeframe):
-    # Define modo pelo timeframe
+    """
+    Gera um sinal para uma moeda em um timeframe:
+    - modo SWING  (4h)
+    - modo POSICIONAL (1d)
+    """
     modo = "SWING" if timeframe == "4h" else "POSICIONAL"
 
     df = buscar_candles(coin, timeframe=timeframe, limit=120)
@@ -118,42 +172,37 @@ def gerar_sinal(coin, timeframe):
     except Exception:
         return None
 
-    # ATR
     atr_serie = calcular_atr(df)
     atr_valor = atr_serie.iloc[-1]
 
-    # Tendência
     direcao = tendencia(df)  # LONG ou SHORT
 
-    # Alvos por Fibonacci
     alvo1, alvo2, alvo3 = fibonacci_alvos(preco, direcao, atr_valor)
 
-    # Ganho do primeiro alvo
     ganho = ganho_percent(preco, alvo1, direcao)
 
-    # Assertividade por moeda e modo
     assert_pct = assertividade(coin, modo)
 
-    # -------------------------
-    # FILTROS OFICIAIS DO PROJETO
-    # -------------------------
-    # 1) ganho mínimo 3%
-    # 2) assertividade mínima 65%
+    # FILTROS OFICIAIS:
+    #  - ganho mínimo 3%
+    #  - assertividade mínima 65%
     if ganho >= 3.0 and assert_pct >= 65.0:
         sinal = direcao
     else:
         sinal = "NAO ENTRAR"
 
-    agora = datetime.now()
-    data_str = agora.strftime("%Y-%m-%d")
-    hora_str = agora.strftime("%H:%M")
+    # Horário em BRT (UTC-3)
+    agora_utc = datetime.utcnow()
+    agora_brt = agora_utc - timedelta(hours=3)
+    data_str = agora_brt.strftime("%Y-%m-%d")
+    hora_str = agora_brt.strftime("%H:%M")
 
-  return {
+    return {
         "par": coin,
         "modo": modo,
         "sinal": sinal,
         "preco": round(preco, 3),
-        "alvo": round(alvo1, 3),      # NOVO CAMPO PARA O PAINEL
+        "alvo": round(alvo1, 3),      # CAMPO USADO PELO PAINEL
         "alvo_1": round(alvo1, 3),
         "alvo_2": round(alvo2, 3),
         "alvo_3": round(alvo3, 3),
@@ -162,6 +211,7 @@ def gerar_sinal(coin, timeframe):
         "data": data_str,
         "hora": hora_str,
     }
+
 
 def gerar_todos():
     swing = []
