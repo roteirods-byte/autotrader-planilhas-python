@@ -148,7 +148,7 @@ def gerar_sinal(coin, timeframe):
     data_str = agora.strftime("%Y-%m-%d")
     hora_str = agora.strftime("%H:%M")
 
-    return {
+  return {
         "par": coin,
         "modo": modo,
         "sinal": sinal,
@@ -161,7 +161,6 @@ def gerar_sinal(coin, timeframe):
         "data": data_str,
         "hora": hora_str,
     }
-
 
 def gerar_todos():
     swing = []
