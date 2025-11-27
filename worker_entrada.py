@@ -153,6 +153,7 @@ def gerar_sinal(coin, timeframe):
         "modo": modo,
         "sinal": sinal,
         "preco": round(preco, 3),
+        "alvo": round(alvo1, 3),      # NOVO CAMPO PARA O PAINEL
         "alvo_1": round(alvo1, 3),
         "alvo_2": round(alvo2, 3),
         "alvo_3": round(alvo3, 3),
