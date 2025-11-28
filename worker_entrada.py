@@ -1,20 +1,21 @@
+import pandas as pd
+import exchanges
 import json
 from datetime import datetime, timedelta
 
-import pandas as pd
-import exchanges
-
-# ============================================================
-#   WORKER DE ENTRADA — VERSÃO PROFISSIONAL (BLINDADA)
-#   - 39 moedas fixas
-#   - ATR + tendência (EMA20/EMA50)
-#   - Alvos por Fibonacci (1, 2 e 3)
-#   - Filtros oficiais:
-#       * ganho mínimo 3%
-#       * assertividade mínima 65%
-#   - Data/hora em BRT (UTC-3)
-#   - Gera arquivo: entrada.json
-# ============================================================
+# ===========================================
+#    WORKER DE ENTRADA PROFISSIONAL
+#
+#  - Tendência (EMA20 x EMA50)
+#  - ATR + ATR%
+#  - FIBONACCI com ATR
+#  - Assertividade PROFISSIONAL (score contínuo)
+#  - Faixas de ATR% amplas (Swing e Posicional)
+#
+#  OBS IMPORTANTES:
+#   - 3% de ganho e 65% de assertividade NÃO são filtros.
+#     Servem APENAS para cor no painel.
+# ===========================================
 
 MOEDAS = [
     "AAVE","ADA","APT","ARB","ATOM","AVAX","AXS","BCH","BNB","BTC","DOGE","DOT","ETH",
@@ -23,11 +24,10 @@ MOEDAS = [
 ]
 
 
+# =====================================================
+# BUSCA OHLCV
+# =====================================================
 def buscar_candles(coin: str, timeframe: str = "4h", limit: int = 120):
-    """
-    Usa as funções de exchanges.py (get_ohlcv ou get_ohlcv_binance)
-    e sempre devolve um DataFrame com colunas: high, low, close.
-    """
     base = coin.split("/")[0].strip().upper()
 
     try:
@@ -36,63 +36,58 @@ def buscar_candles(coin: str, timeframe: str = "4h", limit: int = 120):
         elif hasattr(exchanges, "get_ohlcv_binance"):
             dados = exchanges.get_ohlcv_binance(base, timeframe=timeframe, limit=limit)
         else:
-            raise RuntimeError(
-                "Ajuste buscar_candles() para a função correta em exchanges.py"
-            )
+            raise RuntimeError("Ajuste buscar_candles() para exchanges.py")
 
         if dados is None:
-            print(f"[worker_entrada] Nenhum OHLCV retornado para {base}")
             return None
 
-        # Caso 1: já é DataFrame
+        # Caso venha como DataFrame
         if isinstance(dados, pd.DataFrame):
-            if dados.empty:
-                print(f"[worker_entrada] DataFrame vazio para {base}")
-                return None
-            return dados
+            return dados if not dados.empty else None
 
-        # Caso 2: lista de candles [ts, open, high, low, close, volume]
+        # Caso venha como lista de candles
         if len(dados) == 0:
-            print(f"[worker_entrada] Lista OHLCV vazia para {base}")
             return None
 
         df = pd.DataFrame(
             dados,
-            columns=["timestamp", "open", "high", "low", "close", "volume"],
+            columns=["timestamp","open","high","low","close","volume"]
         )
         return df
 
     except Exception as e:
-        print(f"[worker_entrada] Erro ao buscar candles de {base}: {e}")
+        print(f"[ERRO buscar_candles] {coin}: {e}")
         return None
 
 
+# =====================================================
+# ATR
+# =====================================================
 def calcular_atr(df, periodos=14):
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    tr = pd.concat(
-        [
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
 
     atr = tr.rolling(periodos).mean()
     return atr
 
 
+# =====================================================
+# Tendência
+# =====================================================
 def tendencia(df):
     ema20 = df["close"].ewm(span=20).mean().iloc[-1]
     ema50 = df["close"].ewm(span=50).mean().iloc[-1]
     return "LONG" if ema20 > ema50 else "SHORT"
 
 
+# =====================================================
+# FIBO com ATR
+# =====================================================
 def fibonacci_alvos(preco, direcao, atr):
-    if preco is None or preco <= 0 or pd.isna(atr) or atr <= 0:
+    if preco <= 0 or atr <= 0 or pd.isna(atr):
         return 0.0, 0.0, 0.0
 
     if direcao == "LONG":
@@ -107,112 +102,151 @@ def fibonacci_alvos(preco, direcao, atr):
     return float(alvo1), float(alvo2), float(alvo3)
 
 
+# =====================================================
+# Ganho %
+# =====================================================
 def ganho_percent(preco, alvo, direcao):
-    if preco is None or preco <= 0 or alvo is None or alvo == 0:
+    if preco <= 0 or alvo == 0:
         return 0.0
 
     if direcao == "LONG":
-        ganho = (alvo - preco) / preco * 100.0
+        return round(((alvo - preco) / preco) * 100.0, 2)
     else:
-        ganho = (preco - alvo) / preco * 100.0
-
-    return round(ganho, 2)
+        return round(((preco - alvo) / preco) * 100.0, 2)
 
 
-# ---------------------------
-# ASSERTIVIDADE POR MOEDA/MODO
-# ---------------------------
+# =====================================================
+# ASSERTIVIDADE PROFISSIONAL (SCORE CONTÍNUO)
+# =====================================================
 
 ALTA_CONFIANCA = {
-    "BTC", "ETH", "BNB", "SOL", "AVAX", "LINK", "ATOM",
+    "BTC", "ETH", "BNB", "SOL", "AVAX", "LINK", "ATOM"
 }
 
 MEDIA_CONFIANCA = {
-    "ADA", "NEAR", "OP", "INJ", "AAVE", "LTC", "XRP", "BCH", "DOT", "TIA", "ARB",
+    "ADA","NEAR","OP","INJ","AAVE","LTC","XRP","BCH","DOT","TIA","ARB"
 }
 
 
-def assertividade(moeda, modo):
+def assertividade(moeda, modo, ganho_pct, atr_pct):
     """
-    Retorna assertividade em % por moeda e modo.
-    Valores sempre >= 68 (acima do mínimo 65% do projeto).
+    Score contínuo = Base + Pontos do ganho + Pontos do ATR
+    Faixa final: 40% a 95%
     """
+
     moeda = moeda.upper()
-    modo = modo.upper()  # "SWING" ou "POSICIONAL"
+    modo = modo.upper()
 
-    if modo == "SWING":
-        if moeda in ALTA_CONFIANCA:
-            return 78.0
-        if moeda in MEDIA_CONFIANCA:
-            return 72.0
-        return 68.0  # demais moedas
-
-    # POSICIONAL
+    # -------------------------
+    # 1) Base por grupo
+    # -------------------------
     if moeda in ALTA_CONFIANCA:
-        return 84.0
-    if moeda in MEDIA_CONFIANCA:
-        return 78.0
-    return 72.0  # demais moedas
+        base = 62.0
+    elif moeda in MEDIA_CONFIANCA:
+        base = 58.0
+    else:
+        base = 54.0
+
+    # -------------------------
+    # 2) Ganho (máx 20%)
+    # -------------------------
+    g = max(0.0, min(ganho_pct, 20.0))
+    ganho_score = (g / 20.0) * 18.0   # até +18
+
+    # -------------------------
+    # 3) ATR % (faixas ideais)
+    # -------------------------
+    if modo == "SWING":
+        if 2.0 <= atr_pct <= 8.0:
+            atr_score = 12.0
+        elif 0.3 <= atr_pct <= 12.0:
+            atr_score = 6.0
+        else:
+            atr_score = -8.0
+    else:  # POSICIONAL
+        if 3.0 <= atr_pct <= 20.0:
+            atr_score = 12.0
+        elif 1.0 <= atr_pct <= 30.0:
+            atr_score = 6.0
+        else:
+            atr_score = -8.0
+
+    score = base + ganho_score + atr_score
+
+    # -------------------------
+    # 4) Limites
+    # -------------------------
+    score = max(40.0, min(score, 95.0))
+
+    return round(score, 2)
 
 
+# =====================================================
+# GERADOR DE SINAL
+# =====================================================
 def gerar_sinal(coin, timeframe):
-    """
-    Gera um sinal para uma moeda em um timeframe:
-    - modo SWING  (4h)
-    - modo POSICIONAL (1d)
-    """
+
     modo = "SWING" if timeframe == "4h" else "POSICIONAL"
 
     df = buscar_candles(coin, timeframe=timeframe, limit=120)
     if df is None or len(df) < 60:
         return None
 
-    try:
-        preco = float(df["close"].iloc[-1])
-    except Exception:
-        return None
+    preco = float(df["close"].iloc[-1])
 
     atr_serie = calcular_atr(df)
     atr_valor = atr_serie.iloc[-1]
 
-    direcao = tendencia(df)  # LONG ou SHORT
+    if pd.isna(atr_valor) or atr_valor <= 0:
+        return None
+
+    atr_pct = abs(atr_valor / preco) * 100.0
+
+    # ATR% (faixas amplas)
+    sinal = None
+    if timeframe == "4h":
+        if not (0.3 <= atr_pct <= 12.0):
+            sinal = "NAO ENTRAR"
+    else:
+        if not (1.0 <= atr_pct <= 30.0):
+            sinal = "NAO ENTRAR"
+
+    direcao = tendencia(df)
 
     alvo1, alvo2, alvo3 = fibonacci_alvos(preco, direcao, atr_valor)
 
     ganho = ganho_percent(preco, alvo1, direcao)
 
-    assert_pct = assertividade(coin, modo)
+    # ASSERT CONTÍNUA
+    assert_pct = assertividade(coin, modo, ganho, atr_pct)
 
-    # FILTROS OFICIAIS:
-    #  - ganho mínimo 3%
-    #  - assertividade mínima 65%
-    if ganho >= 3.0 and assert_pct >= 65.0:
+    # Se ATR% ok → segue tendência
+    if sinal is None:
         sinal = direcao
-    else:
-        sinal = "NAO ENTRAR"
 
-    # Horário em BRT (UTC-3)
+    # Horário BRT
     agora_utc = datetime.utcnow()
     agora_brt = agora_utc - timedelta(hours=3)
-    data_str = agora_brt.strftime("%Y-%m-%d")
-    hora_str = agora_brt.strftime("%H:%M")
 
     return {
         "par": coin,
         "modo": modo,
         "sinal": sinal,
         "preco": round(preco, 3),
-        "alvo": round(alvo1, 3),      # CAMPO USADO PELO PAINEL
+        "alvo": round(alvo1, 3),
         "alvo_1": round(alvo1, 3),
         "alvo_2": round(alvo2, 3),
         "alvo_3": round(alvo3, 3),
         "ganho_pct": ganho,
         "assert_pct": assert_pct,
-        "data": data_str,
-        "hora": hora_str,
+        "data": agora_brt.strftime("%Y-%m-%d"),
+        "hora": agora_brt.strftime("%H:%M"),
     }
 
 
+# =====================================================
+# GERAR TODOS
+# =====================================================
 def gerar_todos():
     swing = []
     posicional = []
@@ -226,22 +260,25 @@ def gerar_todos():
         if p:
             posicional.append(p)
 
-    return {
-        "swing": swing,
-        "posicional": posicional,
-    }
+    return {"swing": swing, "posicional": posicional}
 
 
+# =====================================================
+# SALVAR JSON
+# =====================================================
 def salvar_json(dados):
-    with open("entrada.json", "w", encoding="utf-8") as f:
+    with open("entrada.json","w",encoding="utf-8") as f:
         json.dump(dados, f, indent=4, ensure_ascii=False)
 
 
+# =====================================================
+# MAIN
+# =====================================================
 def main():
     dados = gerar_todos()
     salvar_json(dados)
-    print(f"[OK] Gerados {len(dados['swing'])} sinais swing e {len(dados['posicional'])} sinais posicional.")
-    print("[OK] Arquivo entrada.json atualizado.")
+    print("[OK] entrada.json gerado com sucesso.")
+    print(f"Swing: {len(dados['swing'])}  |  Posicional: {len(dados['posicional'])}")
 
 
 if __name__ == "__main__":
