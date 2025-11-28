@@ -263,13 +263,82 @@ def gerar_todos():
 # SALVAR JSON
 # =====================================================
 def salvar_json(dados):
-    # garante que a pasta data/ existe
+    """
+    Converte o resultado completo de gerar_todos()
+    em um formato SIMPLIFICADO, exatamente igual
+    ao que o painel de ENTRADA espera.
+
+    Formato final:
+
+    {
+      "swing": [
+        {
+          "par": "AAVE",
+          "sinal": "LONG",
+          "preco": 186.171,
+          "alvo": 192.171,
+          "ganho_pct": 32.88,
+          "assert_pct": 66.94,
+          "data": "2025-11-28",
+          "hora": "18:18"
+        },
+        ...
+      ],
+      "posicional": [ ... ]
+    }
+    """
+
+    from config_autotrader import ENTRADA_JSON_PATH, garantir_pastas
+
+    def simplificar_lista(lista):
+        simples = []
+        for s in lista or []:
+            try:
+                par = s.get("par")
+                sinal = s.get("sinal")
+                preco = float(s.get("preco", 0.0))
+
+                # usa "alvo" se existir; senão cai para "alvo_1"
+                alvo_base = s.get("alvo", s.get("alvo_1", 0.0))
+                alvo = float(alvo_base or 0.0)
+
+                ganho = float(s.get("ganho_pct", 0.0))
+                assert_pct = float(s.get("assert_pct", 0.0))
+
+                data_str = s.get("data", "")
+                hora_str = s.get("hora", "")
+
+                simples.append(
+                    {
+                        "par": par,
+                        "sinal": str(sinal) if sinal is not None else "",
+                        "preco": round(preco, 3),
+                        "alvo": round(alvo, 3),
+                        "ganho_pct": round(ganho, 2),
+                        "assert_pct": round(assert_pct, 2),
+                        "data": data_str,
+                        "hora": hora_str,
+                    }
+                )
+            except Exception as e:
+                print(f"[WARN salvar_json] Erro ao simplificar sinal {s}: {e}")
+                continue
+
+        return simples
+
+    swing_raw = dados.get("swing", [])
+    pos_raw = dados.get("posicional", [])
+
+    saida = {
+        "swing": simplificar_lista(swing_raw),
+        "posicional": simplificar_lista(pos_raw),
+    }
+
     garantir_pastas()
     caminho = ENTRADA_JSON_PATH
 
     with open(caminho, "w", encoding="utf-8") as f:
-        json.dump(dados, f, indent=4, ensure_ascii=False)
-
+        json.dump(saida, f, indent=4, ensure_ascii=False)
 # =====================================================
 # MAIN
 # =====================================================
