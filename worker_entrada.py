@@ -2,6 +2,7 @@ import pandas as pd
 import exchanges
 import json
 from datetime import datetime, timedelta
+from config_autotrader import MOEDAS_OFICIAIS, ENTRADA_JSON_PATH, garantir_pastas
 
 # ===========================================
 #    WORKER DE ENTRADA PROFISSIONAL
@@ -17,12 +18,7 @@ from datetime import datetime, timedelta
 #     Servem APENAS para cor no painel.
 # ===========================================
 
-MOEDAS = [
-    "AAVE","ADA","APT","ARB","ATOM","AVAX","AXS","BCH","BNB","BTC","DOGE","DOT","ETH",
-    "FET","FIL","FLUX","ICP","INJ","LDO","LINK","LTC","NEAR","OP","PEPE","POL","RATS","RENDER",
-    "RUNE","SEI","SHIB","SOL","SUI","TIA","TNSR","TON","TRX","UNI","WIF","XRP"
-]
-
+MOEDAS = MOEDAS_OFICIAIS
 
 # =====================================================
 # BUSCA OHLCV
@@ -267,9 +263,12 @@ def gerar_todos():
 # SALVAR JSON
 # =====================================================
 def salvar_json(dados):
-    with open("entrada.json","w",encoding="utf-8") as f:
-        json.dump(dados, f, indent=4, ensure_ascii=False)
+    # garante que a pasta data/ existe
+    garantir_pastas()
+    caminho = ENTRADA_JSON_PATH
 
+    with open(caminho, "w", encoding="utf-8") as f:
+        json.dump(dados, f, indent=4, ensure_ascii=False)
 
 # =====================================================
 # MAIN
