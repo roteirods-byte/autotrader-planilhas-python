@@ -134,7 +134,7 @@ def get_ohlcv(
 # PREÇO AO VIVO (TICKER)
 # =====================================================
 
-def get_price(coin: str) -> float:
+def get_price(coin):
     """
     Retorna o PREÇO AO VIVO (ticker) da moeda em USDT.
 
@@ -142,11 +142,6 @@ def get_price(coin: str) -> float:
       BINANCE, BYBIT, KUCOIN
     - Usa o símbolo padrão "<COIN>/USDT"
     - Se não conseguir em nenhuma, retorna 0.0
-
-    OBS:
-      - Essa função é usada pelo worker_entrada.py para preencher
-        o campo "preco" com o valor mais recente possível.
-      - Não altera nada nas funções de OHLCV já existentes.
     """
     symbol = f"{coin.upper()}/USDT"
 
@@ -164,23 +159,19 @@ def get_price(coin: str) -> float:
     for name, ex_class in exchange_classes:
         try:
             ex = ex_class({"enableRateLimit": True})
-
             ticker = ex.fetch_ticker(symbol)
             # tenta 'last', se não tiver pega 'close'
             price = ticker.get("last") or ticker.get("close")
 
             if price is not None and price > 0:
                 return float(price)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"[WARN get_price] Erro ao buscar preço em {name} para {symbol}: {e}")
             continue
 
     # Fallback final: não conseguiu em nenhuma
     print(f"[WARN get_price] Não foi possível obter preço ao vivo para {symbol}")
     return 0.0
-
-
-
 
 
 
