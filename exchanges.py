@@ -129,6 +129,62 @@ def get_ohlcv(
 
     _log(
         f"FALHA ao buscar OHLCV para {coin} {timeframe} "
+
+# =====================================================
+# PREÇO AO VIVO (TICKER)
+# =====================================================
+
+def get_price(coin: str) -> float:
+    """
+    Retorna o PREÇO AO VIVO (ticker) da moeda em USDT.
+
+    - Tenta buscar em algumas corretoras públicas (sem chave):
+      BINANCE, BYBIT, KUCOIN
+    - Usa o símbolo padrão "<COIN>/USDT"
+    - Se não conseguir em nenhuma, retorna 0.0
+
+    OBS:
+      - Essa função é usada pelo worker_entrada.py para preencher
+        o campo "preco" com o valor mais recente possível.
+      - Não altera nada nas funções de OHLCV já existentes.
+    """
+    symbol = f"{coin.upper()}/USDT"
+
+    # Se ccxt não estiver disponível, não quebra o código
+    if ccxt is None:
+        print("[WARN get_price] ccxt não disponível, retornando 0.0")
+        return 0.0
+
+    exchange_classes = [
+        ("binance", ccxt.binance),
+        ("bybit", ccxt.bybit),
+        ("kucoin", ccxt.kucoin),
+    ]
+
+    for name, ex_class in exchange_classes:
+        try:
+            ex = ex_class({"enableRateLimit": True})
+
+            ticker = ex.fetch_ticker(symbol)
+            # tenta 'last', se não tiver pega 'close'
+            price = ticker.get("last") or ticker.get("close")
+
+            if price is not None and price > 0:
+                return float(price)
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN get_price] Erro ao buscar preço em {name} para {symbol}: {e}")
+            continue
+
+    # Fallback final: não conseguiu em nenhuma
+    print(f"[WARN get_price] Não foi possível obter preço ao vivo para {symbol}")
+    return 0.0
+
+
+
+
+
+
+       
         f"({'; '.join(errors)})"
     )
     return None
