@@ -160,7 +160,6 @@ def get_price(coin):
         try:
             ex = ex_class({"enableRateLimit": True})
             ticker = ex.fetch_ticker(symbol)
-            # tenta 'last', se não tiver pega 'close'
             price = ticker.get("last") or ticker.get("close")
 
             if price is not None and price > 0:
@@ -169,13 +168,5 @@ def get_price(coin):
             print(f"[WARN get_price] Erro ao buscar preço em {name} para {symbol}: {e}")
             continue
 
-    # Fallback final: não conseguiu em nenhuma
     print(f"[WARN get_price] Não foi possível obter preço ao vivo para {symbol}")
     return 0.0
-
-
-
-       
-        f"({'; '.join(errors)})"
-    )
-    return None
