@@ -25,12 +25,23 @@ try:
     from config import TZINFO  # type: ignore
 except Exception:  # fallback para testes
     from zoneinfo import ZoneInfo
+
     TZINFO = ZoneInfo("America/Sao_Paulo")
+
+
+# ======================================================================
+# FUNÇÃO DE LOG SIMPLES
+# ======================================================================
 
 
 def _log(msg: str) -> None:
     """Log simples deste módulo."""
     print(f"[exchanges] {msg}", flush=True)
+
+
+# ======================================================================
+# CRIAÇÃO DAS CONEXÕES COM AS CORRETORAS
+# ======================================================================
 
 
 def _create_exchanges() -> Dict[str, ccxt.Exchange]:
@@ -39,7 +50,8 @@ def _create_exchanges() -> Dict[str, ccxt.Exchange]:
     - KuCoin
     - Gate.io
     - OKX
-    Modo anônimo (somente dados públicos).
+
+    Todas em modo anônimo (somente dados públicos).
     """
     _log("Criando conexões com KuCoin, Gate.io e OKX...")
 
@@ -54,47 +66,71 @@ def _create_exchanges() -> Dict[str, ccxt.Exchange]:
     }
 
 
-# instancia compartilhada
-_EXCHANGES: Dict[str, ccxt.Exchange] = _create_exchanges()
+# ======================================================================
+# CONVERSÃO SIMPLES DE TICKER -> SYMBOL COM USDT
+# ======================================================================
 
 
 def _coin_to_symbol(coin: str) -> str:
     """
-    Converte o ticker em symbol da corretora.
+    Converte 'BTC' -> 'BTC/USDT', etc.
 
-    - Se já vier "AAVE/USDT", devolve igual.
-    - Se vier só "AAVE", monta "AAVE/USDT".
+    Garante que:
+    - se já vier 'BTC/USDT', usa direto;
+    - se vier 'BTCUSDT', vira 'BTC/USDT';
+    - tudo em maiúsculas.
     """
-    c = coin.strip().upper()
+    c = coin.upper().strip()
 
-    # Já é par completo? Não mexe.
+    # Já está no formato correto
     if "/" in c:
         return c
 
-    # Só ticker? Acrescenta /USDT
+    # Formato BTCUSDT -> BTC/USDT
+    if c.endswith("USDT") and len(c) > 4:
+        base = c[:-4]
+        return f"{base}/USDT"
+
+    # Formato BTC -> BTC/USDT
     return f"{c}/USDT"
+
+
+# ======================================================================
+# OBTENÇÃO DE OHLCV (HISTÓRICO) PARA OS CÁLCULOS
+# ======================================================================
+
 
 def get_ohlcv(
     coin: str,
     timeframe: str,
     limit: int = 200,
-    sleep_between: float = 0.3,
+    sleep_between: float = 0.8,
 ) -> Optional[pd.DataFrame]:
     """
-    Busca candles OHLCV para uma moeda/timeframe usando
-    KuCoin, Gate.io e OKX (nessa ordem).
+    Busca candles OHLCV em uma das corretoras disponíveis.
 
-    Retorna um DataFrame com:
-        index: datetime (TZINFO)
-        colunas: ["open", "high", "low", "close", "volume"]
+    - coin: ticker SEM 'USDT' (ex.: 'BTC', 'ETH').
+    - timeframe: '4h', '1d', etc.
+    - limit: quantidade de candles.
 
-    Se todas as corretoras falharem, retorna None.
+    Estratégia:
+    1) Tenta KuCoin.
+    2) Se falhar, tenta Gate.io.
+    3) Se falhar, tenta OKX.
+    4) Se todas falharem, retorna None.
     """
+    exchanges = _create_exchanges()
     symbol = _coin_to_symbol(coin)
+
+    order = [
+        ("kucoin", exchanges.get("kucoin")),
+        ("gateio", exchanges.get("gateio")),
+        ("okx", exchanges.get("okx")),
+    ]
+
     errors = []
 
-    for name in ("kucoin", "gateio", "okx"):
-        ex = _EXCHANGES.get(name)
+    for name, ex in order:
         if ex is None:
             continue
 
@@ -103,21 +139,23 @@ def get_ohlcv(
             ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
             if not ohlcv:
-                errors.append(f"{name}: resposta vazia")
-                continue
+                raise ValueError("Lista OHLCV vazia")
 
             df = pd.DataFrame(
                 ohlcv,
                 columns=["timestamp", "open", "high", "low", "close", "volume"],
             )
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df["timestamp"] = (
+                pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                .dt.tz_convert(TZINFO)
+            )
             df.set_index("timestamp", inplace=True)
-            df = df.tz_convert(TZINFO)
 
             _log(
-                f"OK {coin} {timeframe} em {name}: {len(df)} candles "
+                f"OK {symbol} em {name}: {len(df)} candles "
                 f"({df.index[0]} -> {df.index[-1]})"
             )
+
             # pequena pausa para respeitar rate limit
             time.sleep(sleep_between)
             return df
@@ -129,46 +167,48 @@ def get_ohlcv(
 
     _log(
         f"FALHA ao buscar OHLCV para {coin} {timeframe} "
+        f"({'; '.join(errors)})"
+    )
+    return None
 
-# =====================================================
+
+# ======================================================================
 # PREÇO AO VIVO (TICKER)
-# =====================================================
+# ======================================================================
 
-def get_price(coin):
+
+def get_price(coin: str) -> float:
     """
-    Retorna o PREÇO AO VIVO (ticker) da moeda em USDT.
+    Retorna o último preço negociado ('last') para `coin` usando as
+    corretoras disponíveis.
 
-    - Tenta buscar em algumas corretoras públicas (sem chave):
-      BINANCE, BYBIT, KUCOIN
-    - Usa o símbolo padrão "<COIN>/USDT"
-    - Se não conseguir em nenhuma, retorna 0.0
+    - coin: ticker SEM "USDT" (ex.: "BTC", "ETH").
+    - Tenta KuCoin, depois Gate.io, depois OKX.
+    - Em caso de falha geral, retorna 0.0.
     """
-    symbol = f"{coin.upper()}/USDT"
+    exchanges = _create_exchanges()
+    symbol = _coin_to_symbol(coin)
 
-    # Se ccxt não estiver disponível, não quebra o código
-    if ccxt is None:
-        print("[WARN get_price] ccxt não disponível, retornando 0.0")
-        return 0.0
-
-    exchange_classes = [
-        ("binance", ccxt.binance),
-        ("bybit", ccxt.bybit),
-        ("kucoin", ccxt.kucoin),
+    order = [
+        ("kucoin", exchanges.get("kucoin")),
+        ("gateio", exchanges.get("gateio")),
+        ("okx", exchanges.get("okx")),
     ]
 
-    for name, ex_class in exchange_classes:
+    for name, ex in order:
+        if ex is None:
+            continue
         try:
-            ex = ex_class({"enableRateLimit": True})
+            _log(f"Buscando preço ao vivo de {symbol} em {name}...")
             ticker = ex.fetch_ticker(symbol)
-            # tenta 'last', se não tiver pega 'close'
-            price = ticker.get("last") or ticker.get("close")
-
-            if price is not None and price > 0:
-                return float(price)
-        except Exception as e:
-            print(f"[WARN get_price] Erro ao buscar preço em {name} para {symbol}: {e}")
+            price = float(ticker.get("last") or ticker.get("close") or 0.0)
+            if price <= 0:
+                raise ValueError(f"Preço inválido retornado por {name}: {price}")
+            _log(f"Preço ao vivo de {symbol} em {name}: {price}")
+            return price
+        except Exception as e:  # noqa: BLE001
+            _log(f"Falha ao buscar preço ao vivo de {symbol} em {name}: {e!r}")
             continue
 
-    # Fallback final: não conseguiu em nenhuma
-    print(f"[WARN get_price] Não foi possível obter preço ao vivo para {symbol}")
+    _log(f"[WARN get_price] Não foi possível obter preço ao vivo para {symbol}")
     return 0.0
