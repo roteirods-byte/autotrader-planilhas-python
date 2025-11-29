@@ -1,399 +1,343 @@
+#!/usr/bin/env python3
+# worker_entrada.py
+#
+# Gera o arquivo data/entrada.json para o painel de ENTRADA.
+# - Usa preço ao vivo (ticker) para cada moeda.
+# - Calcula ALVO a partir do histórico (Fibo + tendência).
+# - Calcula GANHO % somente de (preço_ao_vivo x alvo).
+# - Filtra sinais com GANHO % >= 3% e ASSERT % >= 65%.
+# - Usa timeframe 4h para SWING e 1d para POSICIONAL.
+
 import json
-from datetime import datetime, timedelta
+import math
+import time
+from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-import pandas as pd
-import exchanges
-
-from config_autotrader import (
-    MOEDAS_OFICIAIS,
-    ENTRADA_JSON_PATH,
-    garantir_pastas,
-    agora_data_hora_br,
-    SINAL_CONFIG,
-    ATR_PERIODO,
-)
-
-# ===========================================
-#    WORKER DE ENTRADA PROFISSIONAL (REV 2025-11)
-#
-#  - Histórico multi-timeframe (4h / 1d) para contexto
-#  - Preço AO VIVO (ticker) para coluna PREÇO e ganho%
-#  - Tendência (EMA20 x EMA50)
-#  - ATR + ATR%
-#  - FIBONACCI com ATR
-#  - Assertividade PROFISSIONAL (score contínuo)
-#
-#  OBS:
-#   - 3% de ganho e 65% de assertividade são filtros aplicados
-#     APENAS na hora de exibir/publicar (painel/saída),
-#     não aqui no cálculo bruto.
-# ===========================================
-
-MOEDAS = MOEDAS_OFICIAIS
+import ccxt  # biblioteca de corretoras
 
 
-# =====================================================
-# BUSCA OHLCV
-# =====================================================
-def buscar_candles(coin: str, timeframe: str = "4h", limit: int = 120):
-    base = coin.split("/")[0].strip().upper()
+# ==========================
+# CONFIGURAÇÕES BÁSICAS
+# ==========================
 
-    try:
-        if hasattr(exchanges, "get_ohlcv"):
-            dados = exchanges.get_ohlcv(base, timeframe=timeframe, limit=limit)
-        elif hasattr(exchanges, "get_ohlcv_binance"):
-            dados = exchanges.get_ohlcv_binance(base, timeframe=timeframe, limit=limit)
-        else:
-            raise RuntimeError("Ajuste buscar_candles() para exchanges.py")
+COINS = [
+    "AAVE", "ADA", "APT", "ARB", "ATOM", "AVAX", "AXS", "BCH", "BNB",
+    "BTC", "DOGE", "DOT", "ETH", "FET", "FIL", "FLUX", "ICP", "INJ",
+    "LDO", "LINK", "LTC", "NEAR", "OP", "PEPE", "POL", "RATS",
+    "RENDER", "RUNE", "SEI", "SHIB", "SOL", "SUI", "TIA", "TNSR",
+    "TON", "TRX", "UNI", "WIF", "XRP",
+]
 
-        if dados is None:
-            return None
+TIMEFRAMES = {
+    "SWING": "4h",
+    "POSICIONAL": "1d",
+}
 
-        # Se já veio como DataFrame
-        if isinstance(dados, pd.DataFrame):
-            return dados if not dados.empty else None
-
-        # Caso venha como lista de candles
-        if len(dados) == 0:
-            return None
-
-        df = pd.DataFrame(
-            dados,
-            columns=["timestamp", "open", "high", "low", "close", "volume"],
-        )
-        return df
-
-    except Exception as e:  # noqa: BLE001
-        print(f"[ERRO buscar_candles] {coin}: {e}")
-        return None
+MIN_GAIN_PCT = 3.0      # filtro mínimo de ganho
+MIN_ASSERT_PCT = 65.0   # filtro mínimo de assertividade
+LOOKBACK_CANDLES = 120  # histórico para cálculo
 
 
-# =====================================================
-# BUSCA PREÇO AO VIVO (TICKER)
-# =====================================================
-def buscar_preco_ao_vivo(coin: str) -> float:
+# ==========================
+# CONEXÃO COM CORRETORAS
+# ==========================
+
+def criar_exchanges():
     """
-    Tenta buscar o preço AO VIVO via exchanges.get_price(coin).
-    Se não existir ou falhar, retorna 0.0.
+    Cria conexões públicas com 3 corretoras.
+    (sem uso de chaves – apenas dados públicos)
     """
-    try:
-        if hasattr(exchanges, "get_price"):
-            preco = exchanges.get_price(coin)
-            if preco is not None and preco > 0:
-                return float(preco)
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN buscar_preco_ao_vivo] {coin}: {e}")
-
-    return 0.0
+    print("[exchanges] Criando conexões com KuCoin, Gate.io e OKX...")
+    exchanges = {
+        "kucoin": ccxt.kucoin(),
+        "gateio": ccxt.gateio(),
+        "okx": ccxt.okx(),
+    }
+    return exchanges
 
 
-# =====================================================
-# ATR
-# =====================================================
-def calcular_atr(df: pd.DataFrame, periodos: int | None = None) -> pd.Series:
-    if periodos is None:
-        periodos = ATR_PERIODO
-
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - df["close"].shift()).abs(),
-            (df["low"] - df["close"].shift()).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    atr = tr.rolling(periodos).mean()
-    return atr
-
-
-# =====================================================
-# Tendência
-# =====================================================
-def tendencia(df: pd.DataFrame) -> str:
-    ema20 = df["close"].ewm(span=20).mean().iloc[-1]
-    ema50 = df["close"].ewm(span=50).mean().iloc[-1]
-    return "LONG" if ema20 > ema50 else "SHORT"
+def _fetch_first_ok(exchanges, func_name, *args, **kwargs):
+    """
+    Tenta a mesma chamada em todas as corretoras até funcionar.
+    """
+    last_error = None
+    for name, ex in exchanges.items():
+        try:
+            if func_name == "ohlcv":
+                data = ex.fetch_ohlcv(*args, **kwargs)
+            elif func_name == "ticker":
+                data = ex.fetch_ticker(*args, **kwargs)
+            else:
+                raise ValueError(f"função desconhecida: {func_name}")
+            print(f"[exchanges] OK {func_name} em {name} para {args[0]}")
+            return data
+        except Exception as e:
+            print(f"[exchanges] Erro em {name} para {func_name} {args[0]}: {e}")
+            last_error = e
+            continue
+    raise last_error if last_error else RuntimeError("Nenhuma exchange disponível")
 
 
-# =====================================================
-# FIBO com ATR
-# =====================================================
-def fibonacci_alvos(preco: float, direcao: str, atr: float) -> tuple[float, float, float]:
-    if preco <= 0 or atr <= 0 or pd.isna(atr):
-        return 0.0, 0.0, 0.0
-
-    if direcao == "LONG":
-        alvo1 = preco + atr * 1.618
-        alvo2 = preco + atr * 2.618
-        alvo3 = preco + atr * 4.236
-    else:
-        alvo1 = preco - atr * 1.618
-        alvo2 = preco - atr * 2.618
-        alvo3 = preco - atr * 4.236
-
-    return float(alvo1), float(alvo2), float(alvo3)
+def get_ohlcv_multi(exchanges, symbol, timeframe, limit):
+    """
+    Busca OHLCV em alguma corretora disponível.
+    """
+    print(f"[exchanges] Buscando OHLCV {symbol} {timeframe}...")
+    data = _fetch_first_ok(exchanges, "ohlcv", symbol, timeframe, limit=limit)
+    return data
 
 
-# =====================================================
-# Ganho %
-# =====================================================
-def ganho_percent(preco: float, alvo: float, direcao: str) -> float:
-    if preco <= 0 or alvo == 0:
+def get_price_live(exchanges, symbol):
+    """
+    Busca o preço AO VIVO (ticker.last).
+    """
+    print(f"[exchanges] Buscando preço ao vivo de {symbol}...")
+    ticker = _fetch_first_ok(exchanges, "ticker", symbol)
+    return float(ticker["last"])
+
+
+# ==========================
+# CÁLCULOS DE INDICADORES
+# ==========================
+
+def ema(series, period):
+    """
+    Calcula EMA simples em uma lista de valores.
+    Retorna lista com mesmo tamanho da série.
+    """
+    if not series:
+        return []
+
+    k = 2 / (period + 1)
+    ema_vals = [series[0]]
+    for price in series[1:]:
+        ema_vals.append(price * k + ema_vals[-1] * (1 - k))
+    return ema_vals
+
+
+def calc_atr(ohlcv, period=14):
+    """
+    Calcula ATR a partir de OHLCV.
+    ohlcv: lista de [timestamp, open, high, low, close, volume]
+    Retorna ATR atual (último valor).
+    """
+    if len(ohlcv) < period + 1:
         return 0.0
 
-    if direcao == "LONG":
-        return round(((alvo - preco) / preco) * 100.0, 2)
+    trs = []
+    for i in range(1, len(ohlcv)):
+        high = ohlcv[i][2]
+        low = ohlcv[i][3]
+        prev_close = ohlcv[i-1][4]
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        trs.append(tr)
+
+    atr_series = ema(trs, period)
+    return float(atr_series[-1]) if atr_series else 0.0
+
+
+def detectar_tendencia(closes):
+    """
+    Define LONG/SHORT com base em EMA20 x EMA50.
+    """
+    if len(closes) < 50:
+        return "NEUTRO"
+
+    ema20 = ema(closes, 20)[-1]
+    ema50 = ema(closes, 50)[-1]
+
+    if ema20 > ema50 * 1.002:   # pequena folga
+        return "LONG"
+    elif ema20 < ema50 * 0.998:
+        return "SHORT"
     else:
-        return round(((preco - alvo) / preco) * 100.0, 2)
+        return "NEUTRO"
 
 
-# =====================================================
-# ASSERTIVIDADE PROFISSIONAL
-# =====================================================
-
-ALTA_CONFIANCA = {
-    "BTC",
-    "ETH",
-    "BNB",
-    "SOL",
-    "AVAX",
-    "LINK",
-    "ATOM",
-}
-
-MEDIA_CONFIANCA = {
-    "ADA",
-    "NEAR",
-    "OP",
-    "INJ",
-    "AAVE",
-    "LTC",
-    "XRP",
-    "BCH",
-    "DOT",
-    "TIA",
-    "ARB",
-}
-
-
-def assertividade(moeda: str, modo: str, ganho_pct: float, atr_pct: float) -> float:
+def calcular_alvo_fibo(ohlcv, side):
     """
-    Score contínuo = Base + Pontos do ganho + Pontos do ATR
-    Faixa final: 40% a 95%
+    Calcula um alvo aproximado usando Fibo de extensão
+    sobre o último movimento relevante (máx/min recente).
     """
-
-    moeda = moeda.upper()
-    modo = modo.upper()
-
-    # 1) Base por grupo
-    if moeda in ALTA_CONFIANCA:
-        base = 62.0
-    elif moeda in MEDIA_CONFIANCA:
-        base = 58.0
-    else:
-        base = 54.0
-
-    # 2) Ganho (máx 20%)
-    g = max(0.0, min(ganho_pct, 20.0))
-    ganho_score = (g / 20.0) * 18.0  # até +18
-
-    # 3) ATR % (faixas ideais)
-    if modo == "SWING":
-        if 2.0 <= atr_pct <= 8.0:
-            atr_score = 12.0
-        elif 0.3 <= atr_pct <= 12.0:
-            atr_score = 6.0
-        else:
-            atr_score = -8.0
-    else:  # POSICIONAL
-        if 3.0 <= atr_pct <= 20.0:
-            atr_score = 12.0
-        elif 1.0 <= atr_pct <= 30.0:
-            atr_score = 6.0
-        else:
-            atr_score = -8.0
-
-    score = base + ganho_score + atr_score
-
-    # 4) Limites
-    score = max(40.0, min(score, 95.0))
-
-    return round(score, 2)
-
-
-# =====================================================
-# GERADOR DE SINAL (usa HISTÓRICO + PREÇO AO VIVO)
-# =====================================================
-def gerar_sinal(coin: str, timeframe: str) -> dict | None:
-    """
-    - Usa candles 4h/1d para contexto (tendência, ATR, Fibo).
-    - Usa preço AO VIVO (ticker) para PREÇO e ganho %.
-    """
-
-    modo = "SWING" if timeframe == "4h" else "POSICIONAL"
-
-    df = buscar_candles(coin, timeframe=timeframe, limit=120)
-    if df is None or len(df) < 60:
+    if len(ohlcv) < 10:
         return None
 
-    # Preço de referência do candle (fallback)
-    preco_candle = float(df["close"].iloc[-1])
+    highs = [c[2] for c in ohlcv[-60:]]  # janela recente
+    lows = [c[3] for c in ohlcv[-60:]]
 
-    # Tenta buscar preço ao vivo
-    preco_live = buscar_preco_ao_vivo(coin)
-    preco = preco_live if preco_live > 0 else preco_candle
-
-    atr_serie = calcular_atr(df, periodos=ATR_PERIODO)
-    atr_valor = atr_serie.iloc[-1]
-
-    if pd.isna(atr_valor) or atr_valor <= 0:
+    swing_high = max(highs)
+    swing_low = min(lows)
+    amplitude = swing_high - swing_low
+    if amplitude <= 0:
         return None
 
-    atr_pct = abs(atr_valor / preco) * 100.0
+    fib_ext = 1.618  # extensão principal
 
-    # ATR% (faixas amplas) definem se é "NAO ENTRAR"
-    sinal = None
-    if timeframe == "4h":
-        # SWING
-        if not (0.3 <= atr_pct <= 12.0):
-            sinal = "NAO ENTRAR"
+    if side == "LONG":
+        # alvo acima da máxima recente
+        alvo = swing_high + amplitude * fib_ext
     else:
-        # POSICIONAL
-        if not (1.0 <= atr_pct <= 30.0):
-            sinal = "NAO ENTRAR"
+        # alvo abaixo da mínima recente
+        alvo = swing_low - amplitude * fib_ext
 
-    direcao = tendencia(df)
-
-    alvo1, alvo2, alvo3 = fibonacci_alvos(preco, direcao, atr_valor)
-
-    ganho = ganho_percent(preco, alvo1, direcao)
-
-    # ASSERT CONTÍNUA
-    assert_pct = assertividade(coin, modo, ganho, atr_pct)
-
-    # Se ATR% ok → segue tendência
-    if sinal is None:
-        sinal = direcao
-
-    # Data/hora BRT via config_autotrader
-    data_str, hora_str = agora_data_hora_br()
-
-    return {
-        "par": coin,
-        "modo": modo,
-        "sinal": sinal,
-        "preco": round(preco, 3),
-        "alvo": round(alvo1, 3),
-        "alvo_1": round(alvo1, 3),
-        "alvo_2": round(alvo2, 3),
-        "alvo_3": round(alvo3, 3),
-        "ganho_pct": ganho,
-        "assert_pct": assert_pct,
-        "data": data_str,
-        "hora": hora_str,
-    }
+    return float(alvo)
 
 
-# =====================================================
-# GERAR TODOS
-# =====================================================
-def gerar_todos() -> dict:
-    swing: list[dict] = []
-    posicional: list[dict] = []
+def calcular_assertividade(preco, alvo, atr):
+    """
+    Cria uma métrica de "assertividade" baseada em
+    (distância até o alvo / ATR). Quanto maior a
+    relação, maior a assertividade (até um teto).
+    """
+    if atr <= 0:
+        return 60.0
 
-    for coin in MOEDAS:
-        s = gerar_sinal(coin, "4h")
-        if s:
-            swing.append(s)
+    dist = abs(alvo - preco)
+    rr = dist / atr  # "reward / ATR"
 
-        p = gerar_sinal(coin, "1d")
-        if p:
-            posicional.append(p)
+    # mapeia rr em 60%..90%
+    base = 60.0
+    extra = min(rr, 3.0) * 10.0  # até +30
+    assert_pct = base + extra
+    if assert_pct > 90.0:
+        assert_pct = 90.0
 
-    return {
-        "swing": swing,
-        "posicional": posicional,
-    }
+    return round(assert_pct, 2)
 
 
-# =====================================================
-# SALVAR JSON (FORMATO SIMPLIFICADO PARA O PAINEL)
-# =====================================================
-def _simplificar_lista(lista: list[dict]) -> list[dict]:
-    simples: list[dict] = []
+# ==========================
+# GERAÇÃO DOS SINAIS
+# ==========================
 
-    for s in lista or []:
+def gerar_sinais_para_modo(exchanges, modo, timeframe):
+    """
+    Gera lista de sinais para um modo (SWING / POSICIONAL).
+    """
+    resultados = []
+
+    for coin in COINS:
+        symbol = f"{coin}/USDT"
+
         try:
-            par = s.get("par")
-            sinal = s.get("sinal")
-            preco = float(s.get("preco", 0.0))
-
-            # usa "alvo" se existir; senão cai para "alvo_1"
-            alvo_base = s.get("alvo", s.get("alvo_1", 0.0))
-            alvo = float(alvo_base or 0.0)
-
-            ganho = float(s.get("ganho_pct", 0.0))
-            assert_pct = float(s.get("assert_pct", 0.0))
-
-            data_str = s.get("data", "")
-            hora_str = s.get("hora", "")
-
-            simples.append(
-                {
-                    "par": par,
-                    "sinal": str(sinal) if sinal is not None else "",
-                    "preco": round(preco, 3),
-                    "alvo": round(alvo, 3),
-                    "ganho_pct": round(ganho, 2),
-                    "assert_pct": round(assert_pct, 2),
-                    "data": data_str,
-                    "hora": hora_str,
-                }
+            # 1) Histórico para cálculo (Fibo, ATR, tendência)
+            ohlcv = get_ohlcv_multi(
+                exchanges,
+                symbol,
+                timeframe,
+                limit=LOOKBACK_CANDLES
             )
-        except Exception as e:  # noqa: BLE001
-            print(f"[WARN salvar_json] Erro ao simplificar sinal {s}: {e}")
+            closes = [c[4] for c in ohlcv]
+
+            # 2) Tendência -> LONG / SHORT
+            side = detectar_tendencia(closes)
+            if side == "NEUTRO":
+                print(f"[sinais] {coin} sem tendência clara, pulando.")
+                continue
+
+            # 3) Preço ao vivo
+            preco_live = get_price_live(exchanges, symbol)
+
+            # 4) ATR (volatilidade)
+            atr = calc_atr(ohlcv)
+
+            # 5) Alvo (modelo Fibo + histórico)
+            alvo = calcular_alvo_fibo(ohlcv, side)
+            if alvo is None:
+                print(f"[sinais] {coin} sem alvo calculado, pulando.")
+                continue
+
+            # 6) GANHO % = resultado do modelo no momento,
+            #    usando apenas preço ao vivo x alvo.
+            if side == "LONG":
+                ganho_pct = (alvo / preco_live - 1.0) * 100.0
+            else:
+                ganho_pct = (preco_live / alvo - 1.0) * 100.0
+
+            ganho_pct = round(ganho_pct, 2)
+
+            # 7) ASSERT % = função da relação (distância / ATR)
+            assert_pct = calcular_assertividade(preco_live, alvo, atr)
+
+            # 8) Filtros oficiais
+            if ganho_pct < MIN_GAIN_PCT:
+                print(f"[filtro] {coin} {modo}: ganho {ganho_pct:.2f}% < {MIN_GAIN_PCT}%.")
+                continue
+
+            if assert_pct < MIN_ASSERT_PCT:
+                print(f"[filtro] {coin} {modo}: assert {assert_pct:.2f}% < {MIN_ASSERT_PCT}%.")
+                continue
+
+            # 9) Data/Hora em BRT
+            now = datetime.now(ZoneInfo("America/Sao_Paulo"))
+            data_str = now.strftime("%Y-%m-%d")
+            hora_str = now.strftime("%H:%M")
+
+            registro = {
+                "par": coin,
+                "modo": modo,
+                "sinal": side,
+                "preco": round(preco_live, 3),
+                "alvo": round(alvo, 3),
+                "ganho_pct": ganho_pct,
+                "assert_pct": assert_pct,
+                "data": data_str,
+                "hora": hora_str,
+            }
+
+            resultados.append(registro)
+            print(f"[sinais] {modo} {coin}: {side} preco={registro['preco']} alvo={registro['alvo']} "
+                  f"ganho={ganho_pct:.2f}% assert={assert_pct:.2f}%")
+
+        except Exception as e:
+            print(f"[erro] Falha ao processar {coin} ({modo}): {e}")
             continue
 
-    return simples
+        # pequena pausa para não sobrecarregar as APIs
+        time.sleep(0.3)
+
+    return resultados
 
 
-def salvar_json(dados: dict) -> None:
-    """
-    Converte o resultado completo de gerar_todos()
-    em um formato SIMPLIFICADO, exatamente igual
-    ao que o painel de ENTRADA espera.
+# ==========================
+# ROTINA PRINCIPAL
+# ==========================
 
-    Formato final:
+def main():
+    base_dir = Path(__file__).resolve().parent
+    data_dir = base_dir / "data"
+    data_dir.mkdir(exist_ok=True)
+    saida_arquivo = data_dir / "entrada.json"
 
-    {
-      "swing": [ { ...campos... }, ... ],
-      "posicional": [ { ...campos... }, ... ]
+    exchanges = criar_exchanges()
+
+    swing_sinais = gerar_sinais_para_modo(
+        exchanges,
+        modo="SWING",
+        timeframe=TIMEFRAMES["SWING"],
+    )
+
+    pos_sinais = gerar_sinais_para_modo(
+        exchanges,
+        modo="POSICIONAL",
+        timeframe=TIMEFRAMES["POSICIONAL"],
+    )
+
+    dados = {
+        "swing": swing_sinais,
+        "posicional": pos_sinais,
     }
-    """
-    swing_raw = dados.get("swing", [])
-    pos_raw = dados.get("posicional", [])
 
-    saida = {
-        "swing": _simplificar_lista(swing_raw),
-        "posicional": _simplificar_lista(pos_raw),
-    }
+    with saida_arquivo.open("w", encoding="utf-8") as f:
+        json.dump(dados, f, ensure_ascii=False, indent=4)
 
-    garantir_pastas()
-    caminho = ENTRADA_JSON_PATH
-
-    with open(caminho, "w", encoding="utf-8") as f:
-        json.dump(saida, f, indent=4, ensure_ascii=False)
-
-
-# =====================================================
-# MAIN
-# =====================================================
-def main() -> None:
-    dados = gerar_todos()
-    salvar_json(dados)
-    print("[OK] entrada.json gerado com sucesso.")
-    print(f"Swing: {len(dados['swing'])}  |  Posicional: {len(dados['posicional'])}")
+    print(f"[OK] entrada.json gerado em {saida_arquivo}")
+    print(f"Swing: {len(swing_sinais)} | Posicional: {len(pos_sinais)}")
 
 
 if __name__ == "__main__":
