@@ -36,7 +36,6 @@ TIMEFRAMES = {
 }
 
 MIN_GAIN_PCT = 3.0      # filtro mínimo de ganho
-MIN_ASSERT_PCT = 65.0   # filtro mínimo de assertividade
 LOOKBACK_CANDLES = 120  # histórico para cálculo
 
 
@@ -218,6 +217,14 @@ def calcular_assertividade(preco, alvo, atr):
 def gerar_sinais_para_modo(exchanges, modo, timeframe):
     """
     Gera lista de sinais para um modo (SWING / POSICIONAL).
+
+    Regras atuais (acordadas com o JORGE):
+    - TODAS as moedas de COINS devem aparecer sempre no JSON.
+    - O campo "sinal" pode ser: "LONG", "SHORT" ou "NÃO ENTRAR".
+    - O limiar de 3% (MIN_GAIN_PCT) NÃO exclui a moeda:
+      - ganho_pct >= MIN_GAIN_PCT e tendência válida -> sinal = LONG/SHORT
+      - ganho_pct <  MIN_GAIN_PCT ou tendência neutra -> sinal = "NÃO ENTRAR"
+    - A assertividade (assert_pct) nunca é filtro, apenas indicador visual no painel.
     """
     resultados = []
 
@@ -230,15 +237,12 @@ def gerar_sinais_para_modo(exchanges, modo, timeframe):
                 exchanges,
                 symbol,
                 timeframe,
-                limit=LOOKBACK_CANDLES
+                limit=LOOKBACK_CANDLES,
             )
             closes = [c[4] for c in ohlcv]
 
-            # 2) Tendência -> LONG / SHORT
-            side = detectar_tendencia(closes)
-            if side == "NEUTRO":
-                print(f"[sinais] {coin} sem tendência clara, pulando.")
-                continue
+            # 2) Tendência bruta (LONG / SHORT / NEUTRO)
+            side_trend = detectar_tendencia(closes)
 
             # 3) Preço ao vivo
             preco_live = get_price_live(exchanges, symbol)
@@ -246,42 +250,45 @@ def gerar_sinais_para_modo(exchanges, modo, timeframe):
             # 4) ATR (volatilidade)
             atr = calc_atr(ohlcv)
 
-            # 5) Alvo (modelo Fibo + histórico)
-            alvo = calcular_alvo_fibo(ohlcv, side)
-            if alvo is None:
-                print(f"[sinais] {coin} sem alvo calculado, pulando.")
-                continue
+            # Valores padrão (fallback) caso algo não possa ser calculado
+            ganho_pct = 0.0
+            assert_pct = 0.0
+            alvo = preco_live
 
-            # 6) GANHO % = resultado do modelo no momento,
-            #    usando apenas preço ao vivo x alvo.
-            if side == "LONG":
-                ganho_pct = (alvo / preco_live - 1.0) * 100.0
+            # 5) Só tentamos calcular alvo/ganho/assert se houver tendência clara e ATR > 0
+            if side_trend in ("LONG", "SHORT") and atr > 0:
+                alvo_calc = calcular_alvo_fibo(ohlcv, side_trend)
+
+                if alvo_calc is not None:
+                    alvo = alvo_calc
+
+                    # 6) GANHO % = diferença entre preço ao vivo e alvo
+                    if side_trend == "LONG":
+                        ganho_pct = (alvo / preco_live - 1.0) * 100.0
+                    else:
+                        ganho_pct = (preco_live / alvo - 1.0) * 100.0
+
+                    ganho_pct = round(ganho_pct, 2)
+
+                    # 7) ASSERT % = função da relação (distância / ATR)
+                    assert_pct = calcular_assertividade(preco_live, alvo, atr)
+
+            # 8) Decisão final do sinal usando o limiar de 3%
+            if side_trend == "NEUTRO" or ganho_pct < MIN_GAIN_PCT:
+                sinal_final = "NÃO ENTRAR"
             else:
-                ganho_pct = (preco_live / alvo - 1.0) * 100.0
-
-            ganho_pct = round(ganho_pct, 2)
-
-            # 7) ASSERT % = função da relação (distância / ATR)
-            assert_pct = calcular_assertividade(preco_live, alvo, atr)
-
-            # 8) Filtros oficiais
-            if ganho_pct < MIN_GAIN_PCT:
-                print(f"[filtro] {coin} {modo}: ganho {ganho_pct:.2f}% < {MIN_GAIN_PCT}%.")
-                continue
-
-            if assert_pct < MIN_ASSERT_PCT:
-                print(f"[filtro] {coin} {modo}: assert {assert_pct:.2f}% < {MIN_ASSERT_PCT}%.")
-                continue
+                sinal_final = side_trend
 
             # 9) Data/Hora em BRT
             now = datetime.now(ZoneInfo("America/Sao_Paulo"))
             data_str = now.strftime("%Y-%m-%d")
             hora_str = now.strftime("%H:%M")
 
+            # 10) Registro final
             registro = {
                 "par": coin,
                 "modo": modo,
-                "sinal": side,
+                "sinal": sinal_final,
                 "preco": round(preco_live, 3),
                 "alvo": round(alvo, 3),
                 "ganho_pct": ganho_pct,
@@ -291,18 +298,43 @@ def gerar_sinais_para_modo(exchanges, modo, timeframe):
             }
 
             resultados.append(registro)
-            print(f"[sinais] {modo} {coin}: {side} preco={registro['preco']} alvo={registro['alvo']} "
-                  f"ganho={ganho_pct:.2f}% assert={assert_pct:.2f}%")
+
+            print(
+                f"[sinais] {modo} {coin}: {sinal_final} "
+                f"preco={registro['preco']} alvo={registro['alvo']} "
+                f"ganho={ganho_pct:.2f}% assert={assert_pct:.2f}% "
+                f"(trend={side_trend})"
+            )
 
         except Exception as e:
+            # Em caso de erro, ainda assim registramos a moeda como "NÃO ENTRAR"
             print(f"[erro] Falha ao processar {coin} ({modo}): {e}")
-            continue
 
-        # pequena pausa para não sobrecarregar as APIs
+            try:
+                now = datetime.now(ZoneInfo("America/Sao_Paulo"))
+                data_str = now.strftime("%Y-%m-%d")
+                hora_str = now.strftime("%H:%M")
+
+                registro = {
+                    "par": coin,
+                    "modo": modo,
+                    "sinal": "NÃO ENTRAR",
+                    "preco": 0.0,
+                    "alvo": 0.0,
+                    "ganho_pct": 0.0,
+                    "assert_pct": 0.0,
+                    "data": data_str,
+                    "hora": hora_str,
+                }
+                resultados.append(registro)
+            except Exception:
+                # Não deve acontecer, mas não pode quebrar o loop.
+                pass
+
+        # 11) Pequena pausa para não sobrecarregar as APIs
         time.sleep(0.3)
 
     return resultados
-
 
 # ==========================
 # ROTINA PRINCIPAL
