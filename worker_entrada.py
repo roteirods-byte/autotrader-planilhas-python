@@ -3,15 +3,14 @@
 #
 # Gera o arquivo data/entrada.json para o painel de ENTRADA.
 # - Usa preço ao vivo (ticker) para cada moeda.
-# - Calcula ALVO a partir do histórico (Fibo simples + tendência).
+# - Calcula ALVO a partir do histórico (alvo estatístico adaptativo).
 # - Calcula GANHO % somente de (preço_ao_vivo x alvo).
-# - Usa filtro de 3% APENAS para classificar o sinal: LONG/SHORT/NAO_ENTRAR.
+# - Usa filtro de 3% APENAS para classificar LONG/SHORT/NAO_ENTRAR.
 # - Assertividade NÃO é filtro (apenas cor no painel).
 # - Em caso de erro em alguma moeda, gera registro NAO_ENTRAR com zeros.
 # - SWING (4h) e POSICIONAL (1d).
 
 import json
-import math
 import time
 from pathlib import Path
 from datetime import datetime
@@ -38,7 +37,6 @@ TIMEFRAMES = {
 }
 
 MIN_GAIN_PCT = 3.0      # filtro mínimo de ganho para classificar LONG/SHORT
-MIN_ASSERT_PCT = 65.0   # NÃO usado como filtro (apenas referência visual)
 LOOKBACK_CANDLES = 120  # histórico para cálculo
 
 
@@ -173,12 +171,13 @@ def detectar_tendencia(closes):
         return "NEUTRO"
 
 
-def calcular_alvo_fibo(ohlcv, side):
+def calcular_alvo_fibo_simples(ohlcv, side, preco_live):
     """
-    Calcula um alvo Fibo simples com base no último movimento.
+    Modelo base de alvo (Fibo) com último movimento.
+    Usado internamente pelo alvo estatístico adaptativo.
     """
     if not ohlcv or len(ohlcv) < 2:
-        return None
+        return preco_live
 
     closes = [c[4] for c in ohlcv]
     last_close = closes[-1]
@@ -190,23 +189,50 @@ def calcular_alvo_fibo(ohlcv, side):
     elif side == "SHORT":
         alvo = last_close - move * 1.618
     else:
-        return None
+        alvo = last_close
 
     return float(alvo)
+
+
+def escolher_alvo_estatistico_adaptativo(ohlcv, atr, side, preco_live):
+    """
+    Função oficial de ALVO estatístico adaptativo.
+    Hoje: usa o modelo Fibo simples como núcleo.
+    No futuro: podemos trocar por um modelo mais avançado
+    (distribuição de retornos, quantis, etc.) sem mudar o restante do worker.
+    """
+    alvo_base = calcular_alvo_fibo_simples(ohlcv, side, preco_live)
+
+    # Pequeno ajuste com ATR para evitar alvo absurdo.
+    if atr <= 0:
+        return alvo_base
+
+    # limita o ajuste em até 2 ATRs para não ficar irreal
+    max_desvio = 2.0 * atr
+
+    if side == "LONG":
+        # alvo não pode ficar mais de 2 ATRs acima do preço
+        alvo_max = preco_live + max_desvio
+        return min(alvo_base, alvo_max)
+    elif side == "SHORT":
+        # alvo não pode ficar mais de 2 ATRs abaixo do preço
+        alvo_min = preco_live - max_desvio
+        return max(alvo_base, alvo_min)
+    else:
+        return preco_live
 
 
 def calcular_assertividade(preco, alvo, atr):
     """
     Assertividade aproximada com base em (distância até o alvo / ATR),
-    mas sem travar sempre em 90%.
+    variando ~60%..80% (não travada em 90%).
     """
     if atr <= 0 or preco <= 0:
         return 60.0
 
     dist = abs(alvo - preco)
-    rr = dist / (atr + 1e-9)  # relação distância/ATR
+    rr = dist / (atr + 1e-9)
 
-    # mapeia rr em ~60%..80%
     base = 60.0
     extra = min(rr, 2.0) * 10.0  # até +20
     assert_pct = base + extra
@@ -268,11 +294,13 @@ def gerar_sinais_para_modo(exchanges, modo, timeframe):
             # 4) ATR (volatilidade)
             atr = calc_atr(ohlcv)
 
-            # 5) Alvo (modelo Fibo + histórico)
-            alvo = calcular_alvo_fibo(ohlcv, side)
-            if alvo is None:
-                print(f"[sinais] {coin} sem alvo calculado, usando alvo = preço atual e ganho 0%.")
-                alvo = preco_live
+            # 5) ALVO estatístico adaptativo (função oficial)
+            alvo = escolher_alvo_estatistico_adaptativo(
+                ohlcv=ohlcv,
+                atr=atr,
+                side=side,
+                preco_live=preco_live,
+            )
 
             # 6) GANHO % = resultado do modelo no momento,
             #    usando apenas preço ao vivo x alvo.
@@ -284,23 +312,21 @@ def gerar_sinais_para_modo(exchanges, modo, timeframe):
                 ganho_pct = 0.0
                 alvo = preco_live
 
-            # arredonda e limita para não dar aberrações gigantes
             ganho_pct = round(ganho_pct, 2)
             if ganho_pct > 50.0:
                 ganho_pct = 50.0
             if ganho_pct < -50.0:
                 ganho_pct = -50.0
 
-            # 7) ASSERT % = função da relação (distância / ATR)
+            # 7) ASSERT %
             assert_pct = calcular_assertividade(preco_live, alvo, atr)
 
-            # 8) Classificação do sinal (sem filtrar moedas)
+            # 8) Classificação do sinal
             if side in ("LONG", "SHORT") and ganho_pct >= MIN_GAIN_PCT:
                 sinal_final = side
             else:
                 sinal_final = "NAO_ENTRAR"
 
-            # 9) Data/Hora em BRT
             now = datetime.now(ZoneInfo("America/Sao_Paulo"))
             data_str = now.strftime("%Y-%m-%d")
             hora_str = now.strftime("%H:%M")
@@ -326,11 +352,9 @@ def gerar_sinais_para_modo(exchanges, modo, timeframe):
 
         except Exception as e:
             print(f"[erro] Falha ao processar {coin} ({modo}): {e}")
-            # Garante que a moeda apareça como NAO_ENTRAR
             registro = gerar_registro_fallback(coin, modo)
             resultados.append(registro)
 
-        # pequena pausa para não sobrecarregar as APIs
         time.sleep(0.3)
 
     return resultados
