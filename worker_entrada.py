@@ -3,11 +3,12 @@
 #
 # Gera o arquivo data/entrada.json para o painel de ENTRADA.
 # - Usa preço ao vivo (ticker) para cada moeda.
-# - Calcula ALVO a partir do histórico (Fibo + tendência).
+# - Calcula ALVO a partir do histórico (Fibo simples + tendência).
 # - Calcula GANHO % somente de (preço_ao_vivo x alvo).
 # - Usa filtro de 3% APENAS para classificar o sinal: LONG/SHORT/NAO_ENTRAR.
-# - Assertividade NÃO é mais filtro (apenas cor no painel).
-# - Usa timeframe 4h para SWING e 1d para POSICIONAL.
+# - Assertividade NÃO é filtro (apenas cor no painel).
+# - Em caso de erro em alguma moeda, gera registro NAO_ENTRAR com zeros.
+# - SWING (4h) e POSICIONAL (1d).
 
 import json
 import math
@@ -196,22 +197,19 @@ def calcular_alvo_fibo(ohlcv, side):
 
 def calcular_assertividade(preco, alvo, atr):
     """
-    Calcula uma assertividade aproximada com base em (distância até o alvo / ATR).
-    Quanto maior a relação, maior a assertividade (até um teto).
+    Assertividade aproximada com base em (distância até o alvo / ATR),
+    mas sem travar sempre em 90%.
     """
-    if atr <= 0:
+    if atr <= 0 or preco <= 0:
         return 60.0
 
     dist = abs(alvo - preco)
-    rr = dist / atr  # "reward / ATR"
+    rr = dist / (atr + 1e-9)  # relação distância/ATR
 
-    # mapeia rr em 60%..90%
+    # mapeia rr em ~60%..80%
     base = 60.0
-    extra = min(rr, 3.0) * 10.0  # até +30
+    extra = min(rr, 2.0) * 10.0  # até +20
     assert_pct = base + extra
-    if assert_pct > 90.0:
-        assert_pct = 90.0
-
     return round(assert_pct, 2)
 
 
@@ -219,9 +217,32 @@ def calcular_assertividade(preco, alvo, atr):
 # GERAÇÃO DE SINAIS
 # ==========================
 
+def gerar_registro_fallback(coin, modo):
+    """
+    Em caso de erro (corretora/timeframe/etc.), garante que a moeda
+    apareça no painel como NAO_ENTRAR.
+    """
+    now = datetime.now(ZoneInfo("America/Sao_Paulo"))
+    data_str = now.strftime("%Y-%m-%d")
+    hora_str = now.strftime("%H:%M")
+
+    return {
+        "par": coin,
+        "modo": modo,
+        "sinal": "NAO_ENTRAR",
+        "preco": 0.0,
+        "alvo": 0.0,
+        "ganho_pct": 0.0,
+        "assert_pct": 60.0,
+        "data": data_str,
+        "hora": hora_str,
+    }
+
+
 def gerar_sinais_para_modo(exchanges, modo, timeframe):
     """
     Gera lista de sinais para um modo (SWING / POSICIONAL).
+    Sempre retorna 39 moedas, mesmo que alguma dê erro.
     """
     resultados = []
 
@@ -240,8 +261,6 @@ def gerar_sinais_para_modo(exchanges, modo, timeframe):
 
             # 2) Tendência -> LONG / SHORT
             side = detectar_tendencia(closes)
-            # Se não houver tendência clara, vamos marcar como NAO_ENTRAR,
-            # mas ainda assim registrar a moeda no painel.
 
             # 3) Preço ao vivo
             preco_live = get_price_live(exchanges, symbol)
@@ -262,20 +281,20 @@ def gerar_sinais_para_modo(exchanges, modo, timeframe):
             elif side == "SHORT":
                 ganho_pct = (preco_live / alvo - 1.0) * 100.0
             else:
-                # Sem tendência clara: não faz sentido projetar alvo direcional.
-                # Consideramos ganho 0 e alvo = preço atual.
                 ganho_pct = 0.0
                 alvo = preco_live
 
+            # arredonda e limita para não dar aberrações gigantes
             ganho_pct = round(ganho_pct, 2)
+            if ganho_pct > 50.0:
+                ganho_pct = 50.0
+            if ganho_pct < -50.0:
+                ganho_pct = -50.0
 
             # 7) ASSERT % = função da relação (distância / ATR)
             assert_pct = calcular_assertividade(preco_live, alvo, atr)
 
             # 8) Classificação do sinal (sem filtrar moedas)
-            # Regra oficial:
-            # - Se há tendência (LONG/SHORT) E ganho_pct >= MIN_GAIN_PCT → sinal = LONG/SHORT
-            # - Caso contrário → sinal = NAO_ENTRAR
             if side in ("LONG", "SHORT") and ganho_pct >= MIN_GAIN_PCT:
                 sinal_final = side
             else:
@@ -307,7 +326,9 @@ def gerar_sinais_para_modo(exchanges, modo, timeframe):
 
         except Exception as e:
             print(f"[erro] Falha ao processar {coin} ({modo}): {e}")
-            continue
+            # Garante que a moeda apareça como NAO_ENTRAR
+            registro = gerar_registro_fallback(coin, modo)
+            resultados.append(registro)
 
         # pequena pausa para não sobrecarregar as APIs
         time.sleep(0.3)
